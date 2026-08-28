@@ -5,7 +5,16 @@
 访问任意目录路径时始终显示该目录下的目录和文件列表，可以逐级进入目录或打开文件。
 HTML 文件会以网页形式直接渲染；使用 `?mode=raw` 可以查看其源码。
 Markdown 文件会渲染为带目录和代码复制能力的阅读页面，
-也可以切换到分栏编辑器实时预览并保存。任意文件 URL 加上 `?mode=raw` 后会跳过
+也可以切换到分栏编辑器实时预览并保存。编辑模式使用 WebSocket 和 CRDT 实时同步，
+支持多人同时修改同一个 Markdown 文件；工具栏会显示在线人数和同步状态。修改在停止输入
+约 500ms 后自动写回文件，也可以点击“立即保存”。连接中断时编辑器会暂时锁定并自动重连，
+避免离线内容覆盖其他协作者的修改。
+
+协同编辑仅在进入 Markdown 编辑模式后启用，单个协作文档最大为 16 MB。协作者当前以匿名
+人数展示，不包含身份、远端光标或历史版本。服务运行期间请避免绕过 HTTP 接口直接修改
+正在协同编辑的文件。
+
+任意文件 URL 加上 `?mode=raw` 后会跳过
 Markdown 等内容转换，直接返回原始内容。
 
 TOML、XML、YAML、TXT、配置文件、Shell 配置、Dockerfile，以及其他经内容检测确认的
@@ -26,11 +35,14 @@ cargo run --release
 
 # 指定端口
 cargo run --release -- -p 3000
+
+# 启动成功后将进程 PID 写入文件；未传 -pid 时不会创建 PID 文件
+cargo run --release -- -p 3000 -pid /tmp/http-file-server.pid
 ```
 
 编译后也可以直接运行：
 
 ```bash
 cargo build --release
-./target/release/http -p 3000
+./target/release/http -p 3000 -pid /tmp/http-file-server.pid
 ```

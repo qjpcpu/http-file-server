@@ -11,6 +11,11 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use tungstenite::handshake::derive_accept_key;
+
+mod collaboration;
+
+use collaboration::CollaborationHub;
 
 const DEFAULT_PORT: u16 = 8080;
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
@@ -18,11 +23,14 @@ const MAX_TEXT_VIEWER_FILE: u64 = 4 * 1024 * 1024;
 const MAX_DRAWIO_VIEWER_FILE: u64 = 16 * 1024 * 1024;
 const DRAWIO_VIEWER_PATH: &str = "/__http_file_server/drawio-viewer-31.3.1.js";
 const DRAWIO_VIEWER_JS: &[u8] = include_bytes!("../assets/drawio-viewer-static-31.3.1.min.js");
+const YJS_PATH: &str = "/__http_file_server/yjs-13.6.32.min.js";
+const YJS_JS: &[u8] = include_bytes!("../assets/yjs-13.6.32.min.js");
 
 #[derive(Debug, PartialEq)]
 struct PortConfig {
     port: u16,
     fallback_to_random: bool,
+    pid_file: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -30,6 +38,10 @@ struct RequestHeaders {
     content_length: usize,
     accept: String,
     fetch_dest: String,
+    connection: String,
+    upgrade: String,
+    websocket_key: String,
+    websocket_version: String,
 }
 
 fn main() {
@@ -60,14 +72,22 @@ fn main() {
         .local_addr()
         .expect("已绑定的监听器应有本地地址")
         .port();
+    if let Some(path) = &port_config.pid_file {
+        if let Err(error) = write_pid_file(path) {
+            eprintln!("无法写入 PID 文件 {}: {error}", path.display());
+            std::process::exit(1);
+        }
+    }
 
     println!("Serving {} at http://localhost:{port}", root.display());
+    let collaboration = CollaborationHub::default();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let root = root.clone();
+                let collaboration = collaboration.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, &root) {
+                    if let Err(error) = handle_connection(stream, &root, &collaboration) {
                         eprintln!("请求处理失败: {error}");
                     }
                 });
@@ -83,6 +103,7 @@ where
 {
     let mut port = DEFAULT_PORT;
     let mut fallback_to_random = true;
+    let mut pid_file = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--port" => {
@@ -95,6 +116,15 @@ where
                 }
                 fallback_to_random = false;
             }
+            "-pid" | "--pid" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} 后需要 PID 文件路径"))?;
+                if value.is_empty() {
+                    return Err("PID 文件路径不能为空".into());
+                }
+                pid_file = Some(PathBuf::from(value));
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 return Ok(None);
@@ -105,6 +135,7 @@ where
     Ok(Some(PortConfig {
         port,
         fallback_to_random,
+        pid_file,
     }))
 }
 
@@ -118,10 +149,18 @@ fn bind_listener(config: &PortConfig) -> io::Result<TcpListener> {
 }
 
 fn usage() -> &'static str {
-    "用法: http [-p PORT]\n\n选项:\n  -p, --port PORT  指定监听端口（默认 8080）\n  -h, --help       显示帮助"
+    "用法: http [-p PORT] [-pid FILE]\n\n选项:\n  -p, --port PORT  指定监听端口（默认 8080）\n  -pid, --pid FILE 将启动进程 PID 写入指定文件\n  -h, --help       显示帮助"
 }
 
-fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
+fn write_pid_file(path: &Path) -> io::Result<()> {
+    fs::write(path, format!("{}\n", std::process::id()))
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    root: &Path,
+    collaboration: &CollaborationHub,
+) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -165,6 +204,14 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
             head_only,
         );
     }
+    if matches!(method, "GET" | "HEAD") && request_path == YJS_PATH {
+        return send_content(
+            &mut stream,
+            YJS_JS,
+            "text/javascript; charset=utf-8",
+            head_only,
+        );
+    }
     if matches!(method, "GET" | "HEAD")
         && matches!(request_path, "/favicon.svg" | "/favicon.ico")
         && !root.join(request_path.trim_start_matches('/')).is_file()
@@ -176,6 +223,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
     let raw_mode = mode.as_deref() == Some("raw");
     let preview_mode = mode.as_deref() == Some("preview");
     let asset_mode = mode.as_deref() == Some("asset");
+    let collaboration_mode = mode.as_deref() == Some("collab");
     let decoded = match percent_decode(request_path) {
         Some(path) => path,
         None => return send_text(&mut stream, 400, "Bad Request", "无效的 URL\n", head_only),
@@ -211,6 +259,63 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
     if !metadata.is_file() {
         let body = render_not_found_page(&decoded);
         return send_html_status(&mut stream, 404, "Not Found", &body, head_only);
+    }
+
+    if collaboration_mode {
+        if method != "GET" || !has_extension(&canonical, "md") {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "仅支持协同编辑 Markdown 文件\n",
+                head_only,
+            );
+        }
+        if !is_websocket_upgrade(&headers) {
+            return send_text(
+                &mut stream,
+                426,
+                "Upgrade Required",
+                "该接口需要 WebSocket 连接\n",
+                false,
+            );
+        }
+        if metadata.len() > MAX_REQUEST_BODY as u64 {
+            return send_text(
+                &mut stream,
+                413,
+                "Content Too Large",
+                "协同编辑的 Markdown 文件不能超过 16 MB\n",
+                false,
+            );
+        }
+        let markdown = match fs::read_to_string(&canonical) {
+            Ok(markdown) => markdown,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return send_text(
+                    &mut stream,
+                    415,
+                    "Unsupported Media Type",
+                    "Markdown 必须是 UTF-8 文本\n",
+                    false,
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        let connection = collaboration.connect(&canonical, &markdown)?;
+        let partially_read = reader.buffer().to_vec();
+        let accept = derive_accept_key(headers.websocket_key.as_bytes());
+        write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )?;
+        drop(reader);
+        return connection.run(
+            stream,
+            partially_read,
+            MAX_REQUEST_BODY * 2,
+            MAX_REQUEST_BODY,
+        );
     }
 
     if method == "POST" {
@@ -249,7 +354,9 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
                 return send_text(&mut stream, 400, "Bad Request", &error, false);
             }
         };
-        fs::write(&canonical, markdown.as_bytes())?;
+        if !collaboration.replace_if_active(&canonical, &markdown)? {
+            fs::write(&canonical, markdown.as_bytes())?;
+        }
         return send_empty(&mut stream, 204, "No Content");
     }
 
@@ -400,10 +507,33 @@ fn read_request_headers<R: BufRead>(reader: &mut R) -> io::Result<RequestHeaders
                 headers.accept = value.trim().to_ascii_lowercase();
             } else if name.eq_ignore_ascii_case("sec-fetch-dest") {
                 headers.fetch_dest = value.trim().to_ascii_lowercase();
+            } else if name.eq_ignore_ascii_case("connection") {
+                headers.connection = value.trim().to_ascii_lowercase();
+            } else if name.eq_ignore_ascii_case("upgrade") {
+                headers.upgrade = value.trim().to_ascii_lowercase();
+            } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+                headers.websocket_key = value.trim().to_string();
+            } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+                headers.websocket_version = value.trim().to_string();
             }
         }
     }
     Ok(headers)
+}
+
+fn is_websocket_upgrade(headers: &RequestHeaders) -> bool {
+    let key = headers.websocket_key.as_bytes();
+    headers.upgrade == "websocket"
+        && headers
+            .connection
+            .split(',')
+            .any(|value| value.trim() == "upgrade")
+        && headers.websocket_version == "13"
+        && key.len() == 24
+        && key[22..] == *b"=="
+        && key[..22]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
 }
 
 fn request_wants_html(headers: &RequestHeaders) -> bool {
@@ -1058,7 +1188,7 @@ fn render_markdown_page(markdown: &str, title: &str) -> String {
     let title = escape_html(title);
     let source = escape_html(markdown);
     format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title}</title>\n<style>{MARKDOWN_CSS}</style>\n</head>\n<body>\n<header class=\"topbar\"><a class=\"home\" href=\"./\" aria-label=\"返回目录\">←</a><span class=\"mark\">MD</span><span class=\"filename\">{title}</span><span class=\"top-actions\"><a class=\"button ghost\" href=\"?mode=raw\">Raw</a><button class=\"button\" id=\"edit-button\" type=\"button\">编辑</button></span></header>\n<div id=\"reader\" class=\"reader-layout\"><aside id=\"toc\" aria-label=\"文档目录\"></aside><main class=\"paper\"><article id=\"article\">{article}</article></main></div>\n<section id=\"editor\" class=\"editor-shell\" hidden><div class=\"editor-toolbar\"><div class=\"format-tools\" role=\"toolbar\" aria-label=\"Markdown 格式\"><button type=\"button\" data-format=\"heading\" title=\"标题\">H</button><button type=\"button\" data-format=\"bold\" title=\"粗体\"><strong>B</strong></button><button type=\"button\" data-format=\"italic\" title=\"斜体\"><em>I</em></button><button type=\"button\" data-format=\"link\" title=\"链接\">↗</button><button type=\"button\" data-format=\"quote\" title=\"引用\">❯</button><button type=\"button\" data-format=\"code\" title=\"代码\">&lt;/&gt;</button><button type=\"button\" data-format=\"list\" title=\"列表\">≡</button><button type=\"button\" data-format=\"task\" title=\"任务\">☑</button></div><span id=\"save-status\" role=\"status\"></span><button class=\"button ghost\" id=\"cancel-button\" type=\"button\">取消</button><button class=\"button\" id=\"save-button\" type=\"button\">保存</button></div><div class=\"editor-panes\"><div class=\"pane preview-pane\"><span>PREVIEW</span><iframe id=\"preview\" title=\"Markdown 实时预览\"></iframe></div><label class=\"pane source-pane\"><span>MARKDOWN</span><textarea id=\"source\" spellcheck=\"false\">{source}</textarea></label></div></section>\n<dialog id=\"discard-dialog\" class=\"confirm-dialog\" aria-labelledby=\"discard-title\" aria-describedby=\"discard-description\"><span class=\"dialog-mark\" aria-hidden=\"true\">!</span><h2 id=\"discard-title\">放弃这次修改？</h2><p id=\"discard-description\">尚未保存的 Markdown 内容将会丢失，且无法恢复。</p><div class=\"dialog-actions\"><button class=\"button ghost\" id=\"keep-editing-button\" type=\"button\">继续编辑</button><button class=\"button danger\" id=\"discard-button\" type=\"button\">放弃修改</button></div></dialog>\n<script>{MARKDOWN_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title}</title>\n<style>{MARKDOWN_CSS}</style>\n</head>\n<body>\n<header class=\"topbar\"><a class=\"home\" href=\"./\" aria-label=\"返回目录\">←</a><span class=\"mark\">MD</span><span class=\"filename\">{title}</span><span class=\"top-actions\"><a class=\"button ghost\" href=\"?mode=raw\">Raw</a><button class=\"button\" id=\"edit-button\" type=\"button\">编辑</button></span></header>\n<div id=\"reader\" class=\"reader-layout\"><aside id=\"toc\" aria-label=\"文档目录\"></aside><main class=\"paper\"><article id=\"article\">{article}</article></main></div>\n<section id=\"editor\" class=\"editor-shell\" hidden><div class=\"editor-toolbar\"><div class=\"format-tools\" role=\"toolbar\" aria-label=\"Markdown 格式\"><button type=\"button\" data-format=\"heading\" title=\"标题\">H</button><button type=\"button\" data-format=\"bold\" title=\"粗体\"><strong>B</strong></button><button type=\"button\" data-format=\"italic\" title=\"斜体\"><em>I</em></button><button type=\"button\" data-format=\"link\" title=\"链接\">↗</button><button type=\"button\" data-format=\"quote\" title=\"引用\">❯</button><button type=\"button\" data-format=\"code\" title=\"代码\">&lt;/&gt;</button><button type=\"button\" data-format=\"list\" title=\"列表\">≡</button><button type=\"button\" data-format=\"task\" title=\"任务\">☑</button></div><span class=\"collaboration-status\" role=\"status\"><i id=\"connection-dot\" aria-hidden=\"true\"></i><span id=\"save-status\">未连接</span><span id=\"presence\"></span></span><button class=\"button ghost\" id=\"cancel-button\" type=\"button\">退出编辑</button><button class=\"button\" id=\"save-button\" type=\"button\">立即保存</button></div><div class=\"editor-panes\"><div class=\"pane preview-pane\"><span>PREVIEW</span><iframe id=\"preview\" title=\"Markdown 实时预览\"></iframe></div><label class=\"pane source-pane\"><span>MARKDOWN</span><textarea id=\"source\" spellcheck=\"false\" disabled>{source}</textarea></label></div></section>\n<script src=\"{YJS_PATH}\"></script><script>{MARKDOWN_JS}</script>\n</body>\n</html>"
     )
 }
 
@@ -1384,28 +1514,24 @@ sup { line-height:0; }
 .editor-toolbar { display:flex; flex:0 0 auto; align-items:center; gap:.6rem; min-height:3.5rem; padding:.6rem max(1rem,calc((100vw - 1400px)/2)); border-bottom:1px solid var(--line); }
 .format-tools { display:flex; gap:.3rem; overflow-x:auto; }
 .format-tools button { flex:0 0 auto; width:2rem; height:2rem; padding:0; color:var(--ink); background:var(--paper); }
-#save-status { margin-left:auto; color:var(--muted); font-size:.75rem; }
+.collaboration-status { display:flex; align-items:center; gap:.42rem; margin-left:auto; color:var(--muted); font-size:.75rem; white-space:nowrap; }
+#connection-dot { width:.5rem; height:.5rem; border-radius:50%; background:#9aa0b3; box-shadow:0 0 0 .2rem color-mix(in srgb,#9aa0b3 15%,transparent); }
+#connection-dot.connected { background:#3b9b67; box-shadow:0 0 0 .2rem color-mix(in srgb,#3b9b67 16%,transparent); }
+#connection-dot.error { background:#bd3e52; box-shadow:0 0 0 .2rem color-mix(in srgb,#bd3e52 16%,transparent); }
+#presence::before { content:"·"; margin-right:.42rem; }
 .editor-panes { display:grid; flex:1 1 auto; grid-template-columns:minmax(0,1fr) minmax(0,1fr); min-height:0; }
 .pane { display:grid; grid-template-rows:2rem 1fr; min-width:0; min-height:0; margin:0; }
 .pane > span { padding:.7rem 1rem; color:var(--muted); background:var(--paper); font:700 .62rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.12em; }
 .preview-pane { border-right:1px solid var(--line); }
 #source { width:100%; height:100%; resize:none; padding:1.25rem clamp(1rem,3vw,2rem); border:0; outline:0; color:var(--ink); background:var(--surface); font:500 .9rem/1.75 ui-monospace,SFMono-Regular,Consolas,"Noto Sans Mono CJK SC",monospace; tab-size:2; }
+#source:disabled { color:var(--muted); cursor:wait; }
 #preview { width:100%; height:100%; border:0; background:var(--paper); }
 .preview-body { min-height:100vh; }
 main.preview-paper { width:100%; margin:0; padding:2rem; border:0; border-radius:0; box-shadow:none; }
 body.editing { overflow:hidden; }
-.confirm-dialog { width:min(calc(100% - 2rem),26rem); padding:1.6rem; border:1px solid var(--line); border-radius:1rem; color:var(--ink); background:var(--surface); box-shadow:0 28px 90px rgba(24,27,42,.3); }
-.confirm-dialog::backdrop { background:rgba(17,19,27,.52); backdrop-filter:blur(5px); }
-.confirm-dialog[open] { animation:dialog-in .16s ease-out both; }
-.dialog-mark { display:grid; place-items:center; width:2.25rem; height:2.25rem; margin-bottom:1.1rem; border-radius:.65rem; color:#bd3e52; background:color-mix(in srgb,#bd3e52 13%,var(--surface)); font:800 1.05rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
-.confirm-dialog h2 { margin:0 0 .55rem; padding:0; border:0; font:700 1.35rem/1.3 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif; letter-spacing:-.015em; }
-.confirm-dialog p { margin:0; color:var(--muted); font-size:.86rem; line-height:1.65; }
-.dialog-actions { display:flex; justify-content:flex-end; gap:.55rem; margin-top:1.5rem; }
-@keyframes dialog-in { from { opacity:0; transform:translateY(8px) scale(.98); } }
 @media (max-width:900px) { .reader-layout { display:block; } #toc { display:none; } }
-@media (max-width:700px) { html { font-size:16px; } .reader-layout { display:block; width:100%; margin:0; } main.paper { padding:1.5rem 1rem 3rem; border-width:0; border-radius:0; box-shadow:none; } .topbar { padding-inline:.7rem; } .mark { display:none; } .editor-panes { grid-template-columns:1fr; grid-template-rows:1fr 1fr; } .preview-pane { border-right:0; border-bottom:1px solid var(--line); } #save-status { display:none; } }
+@media (max-width:700px) { html { font-size:16px; } .reader-layout { display:block; width:100%; margin:0; } main.paper { padding:1.5rem 1rem 3rem; border-width:0; border-radius:0; box-shadow:none; } .topbar { padding-inline:.7rem; } .mark { display:none; } .editor-panes { grid-template-columns:1fr; grid-template-rows:1fr 1fr; } .preview-pane { border-right:0; border-bottom:1px solid var(--line); } .collaboration-status { margin-left:auto; } #save-status { display:none; } }
 @media (prefers-color-scheme:dark) { :root { --paper:#11131b; --surface:#191c27; --ink:#edf0f7; --muted:#a7adbd; --line:#303545; --accent:#a9a5ff; --accent-soft:#292943; --code:#0d0f16; --code-ink:#e7e9f3; --quote:#20283a; } body { background-image:radial-gradient(circle at 50% -20%,#252943 0,transparent 38rem); } code { color:#f2a7ca; } main { box-shadow:0 24px 70px rgba(0,0,0,.25); } }
-@media (prefers-reduced-motion:reduce) { .confirm-dialog[open] { animation:none; } }
 @media (prefers-reduced-motion:no-preference) { main.paper { animation:arrive .35s ease-out both; } @keyframes arrive { from { opacity:0; transform:translateY(8px); } } }
 "#;
 
@@ -1415,43 +1541,60 @@ const editor = document.querySelector('#editor');
 const source = document.querySelector('#source');
 const preview = document.querySelector('#preview');
 const status = document.querySelector('#save-status');
-const discardDialog = document.querySelector('#discard-dialog');
-let original = source.value;
-let previewTimer;
+const presence = document.querySelector('#presence');
+const connectionDot = document.querySelector('#connection-dot');
+const LOCAL_ORIGIN = Symbol('local-input');
+const REMOTE_ORIGIN = Symbol('remote-update');
+const documentState = new Y.Doc();
+const sharedText = documentState.getText('source');
+let socket, reconnectTimer, previewTimer;
+let reconnectDelay = 400;
+let previewRevision = 0;
 let scrollSyncLocked = false;
+let editing = false;
+let synced = false;
+let exitRequested = false;
+let sequence = 0;
+let latestGeneration = 0;
+let savedGeneration = 0;
+const pending = new Set();
 
-function scrollRatio(scrollTop, scrollHeight, clientHeight) {
-  const available = scrollHeight - clientHeight;
-  return available > 0 ? scrollTop / available : 0;
+function setStatus(message, state = '') {
+  status.textContent = message;
+  connectionDot.className = state;
 }
-
+function refreshStatus() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) setStatus('连接已断开', 'error');
+  else if (!synced || pending.size) setStatus('正在同步…');
+  else if (savedGeneration < latestGeneration) setStatus('等待自动保存', 'connected');
+  else setStatus('已保存', 'connected');
+}
+function scrollRatio(top, height, clientHeight) {
+  const available = height - clientHeight;
+  return available > 0 ? top / available : 0;
+}
 function withScrollLock(callback) {
   if (scrollSyncLocked) return;
   scrollSyncLocked = true;
   callback();
   requestAnimationFrame(() => { scrollSyncLocked = false; });
 }
-
 function syncPreviewFromSource() {
   const win = preview.contentWindow;
   const doc = preview.contentDocument;
   if (!win || !doc) return;
   const ratio = scrollRatio(source.scrollTop, source.scrollHeight, source.clientHeight);
-  const previewHeight = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-  withScrollLock(() => win.scrollTo(0, ratio * Math.max(0, previewHeight - win.innerHeight)));
+  const height = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+  withScrollLock(() => win.scrollTo(0, ratio * Math.max(0, height - win.innerHeight)));
 }
-
 function syncSourceFromPreview() {
   const win = preview.contentWindow;
   const doc = preview.contentDocument;
   if (!win || !doc) return;
-  const previewHeight = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-  const ratio = scrollRatio(win.scrollY, previewHeight, win.innerHeight);
-  withScrollLock(() => {
-    source.scrollTop = ratio * Math.max(0, source.scrollHeight - source.clientHeight);
-  });
+  const height = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+  const ratio = scrollRatio(win.scrollY, height, win.innerHeight);
+  withScrollLock(() => { source.scrollTop = ratio * Math.max(0, source.scrollHeight - source.clientHeight); });
 }
-
 function buildViewerTools() {
   const toc = document.querySelector('#toc');
   document.querySelectorAll('#article h2, #article h3').forEach((heading, index) => {
@@ -1475,52 +1618,152 @@ function buildViewerTools() {
     block.append(button);
   });
 }
-
 async function updatePreview() {
-  status.textContent = '正在生成预览…';
+  const revision = ++previewRevision;
   try {
     const response = await fetch(`${location.pathname}?mode=preview`, {
-      method: 'POST',
-      headers: {'Content-Type': 'text/plain; charset=utf-8'},
-      body: source.value
+      method: 'POST', headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: source.value
     });
     if (!response.ok) throw new Error(await response.text());
-    preview.srcdoc = await response.text();
-    status.textContent = source.value === original ? '已保存' : '有未保存修改';
+    const markup = await response.text();
+    if (revision !== previewRevision) return;
+    const currentArticle = preview.contentDocument?.querySelector('article');
+    if (!currentArticle) {
+      preview.srcdoc = markup;
+      return;
+    }
+    const nextDocument = new DOMParser().parseFromString(markup, 'text/html');
+    const nextArticle = nextDocument.querySelector('article');
+    if (!nextArticle) throw new Error('预览内容无效');
+    const previewDocument = currentArticle.ownerDocument;
+    currentArticle.replaceChildren(
+      ...Array.from(nextArticle.childNodes, node => previewDocument.importNode(node, true))
+    );
   } catch (error) {
-    status.textContent = `预览失败：${error.message}`;
+    if (revision !== previewRevision) return;
+    setStatus(`预览失败：${error.message}`, 'error');
   }
 }
-
 function schedulePreview() {
   clearTimeout(previewTimer);
   previewTimer = setTimeout(updatePreview, 220);
-  status.textContent = source.value === original ? '已保存' : '有未保存修改';
 }
-
+function binaryFrame(kind, payload, updateSequence) {
+  const header = updateSequence === undefined ? 1 : 5;
+  const frame = new Uint8Array(header + payload.length);
+  frame[0] = kind;
+  if (updateSequence !== undefined) new DataView(frame.buffer).setUint32(1, updateSequence);
+  frame.set(payload, header);
+  return frame;
+}
+function sendUpdate(update) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  sequence = (sequence + 1) >>> 0;
+  pending.add(sequence);
+  socket.send(binaryFrame(1, update, sequence));
+  refreshStatus();
+}
+function restoreSelection(startPosition, endPosition) {
+  const start = startPosition && Y.createAbsolutePositionFromRelativePosition(startPosition, documentState);
+  const end = endPosition && Y.createAbsolutePositionFromRelativePosition(endPosition, documentState);
+  const length = source.value.length;
+  source.setSelectionRange(Math.min(start?.index ?? length, length), Math.min(end?.index ?? length, length));
+}
+function applyRemoteUpdate(update) {
+  const selectable = !source.disabled;
+  const start = selectable ? Y.createRelativePositionFromTypeIndex(sharedText, source.selectionStart, -1) : null;
+  const end = selectable ? Y.createRelativePositionFromTypeIndex(sharedText, source.selectionEnd, 1) : null;
+  Y.applyUpdate(documentState, update, REMOTE_ORIGIN);
+  source.value = sharedText.toString();
+  if (selectable) restoreSelection(start, end);
+  schedulePreview();
+}
+function handleBinary(payload) {
+  const frame = new Uint8Array(payload);
+  if (frame[0] === 0) {
+    sendUpdate(Y.encodeStateAsUpdate(documentState, frame.slice(1)));
+  } else if (frame[0] === 1) {
+    applyRemoteUpdate(frame.slice(1));
+    synced = true;
+    source.disabled = false;
+    reconnectDelay = 400;
+    refreshStatus();
+    source.focus();
+  }
+}
+function finishExitIfReady() {
+  if (exitRequested && pending.size === 0 && savedGeneration >= latestGeneration) {
+    exitRequested = false;
+    socket?.close(1000, 'leave editor');
+    location.reload();
+  }
+}
+function handleControl(payload) {
+  let message;
+  try { message = JSON.parse(payload); } catch (_) { return; }
+  if (message.type === 'presence') presence.textContent = `${message.count} 人在线`;
+  else if (message.type === 'ack') {
+    pending.delete(message.sequence);
+    latestGeneration = Math.max(latestGeneration, message.generation || 0);
+    refreshStatus();
+  } else if (message.type === 'saved') {
+    savedGeneration = Math.max(savedGeneration, message.generation || 0);
+    refreshStatus();
+    finishExitIfReady();
+  } else if (message.type === 'error') setStatus(message.message || '协作发生错误', 'error');
+}
+function connect() {
+  clearTimeout(reconnectTimer);
+  synced = false;
+  source.disabled = true;
+  setStatus('正在连接…');
+  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  socket = new WebSocket(`${scheme}//${location.host}${location.pathname}?mode=collab`);
+  socket.binaryType = 'arraybuffer';
+  socket.addEventListener('open', () => socket.send(binaryFrame(0, Y.encodeStateVector(documentState))));
+  socket.addEventListener('message', event => {
+    if (typeof event.data === 'string') handleControl(event.data);
+    else handleBinary(event.data);
+  });
+  socket.addEventListener('close', () => {
+    synced = false;
+    source.disabled = true;
+    if (!editing || exitRequested) return;
+    setStatus('连接已断开，正在重连…', 'error');
+    reconnectTimer = setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 5000);
+  });
+  socket.addEventListener('error', () => setStatus('协作连接失败', 'error'));
+}
 function openEditor() {
+  editing = true;
   reader.hidden = true;
   editor.hidden = false;
   document.body.classList.add('editing');
-  source.focus();
   updatePreview();
+  connect();
 }
-
-function leaveEditor(discardChanges) {
-  if (discardChanges) source.value = original;
-  reader.hidden = false;
-  editor.hidden = true;
-  document.body.classList.remove('editing');
-}
-
-function closeEditor() {
-  if (source.value !== original) {
-    discardDialog.showModal();
-    return;
+function syncTextareaChange() {
+  if (source.disabled) return;
+  const before = sharedText.toString();
+  const after = source.value;
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) start++;
+  let beforeEnd = before.length;
+  let afterEnd = after.length;
+  while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+    beforeEnd--;
+    afterEnd--;
   }
-  leaveEditor(false);
+  documentState.transact(() => {
+    if (beforeEnd > start) sharedText.delete(start, beforeEnd - start);
+    if (afterEnd > start) sharedText.insert(start, after.slice(start, afterEnd));
+  }, LOCAL_ORIGIN);
+  schedulePreview();
 }
-
+documentState.on('update', (update, origin) => {
+  if (origin !== REMOTE_ORIGIN) sendUpdate(update);
+});
 function wrapSelection(prefix, suffix = prefix, placeholder = '文本') {
   const start = source.selectionStart;
   const end = source.selectionEnd;
@@ -1529,9 +1772,8 @@ function wrapSelection(prefix, suffix = prefix, placeholder = '文本') {
   source.selectionStart = start + prefix.length;
   source.selectionEnd = start + prefix.length + selected.length;
   source.focus();
-  schedulePreview();
+  syncTextareaChange();
 }
-
 function prefixLines(prefix) {
   const start = source.value.lastIndexOf('\n', Math.max(0, source.selectionStart - 1)) + 1;
   const nextBreak = source.value.indexOf('\n', source.selectionEnd);
@@ -1539,29 +1781,28 @@ function prefixLines(prefix) {
   const text = source.value.slice(start, end).split('\n').map(line => `${prefix}${line}`).join('\n');
   source.setRangeText(text, start, end, 'select');
   source.focus();
-  schedulePreview();
+  syncTextareaChange();
 }
-
 document.querySelector('#edit-button').addEventListener('click', openEditor);
-document.querySelector('#cancel-button').addEventListener('click', closeEditor);
-document.querySelector('#keep-editing-button').addEventListener('click', () => {
-  discardDialog.close();
-  source.focus();
+document.querySelector('#cancel-button').addEventListener('click', () => {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    setStatus('连接恢复后才能安全退出', 'error');
+    return;
+  }
+  exitRequested = true;
+  source.disabled = true;
+  setStatus('正在保存并退出…', 'connected');
+  socket.send(JSON.stringify({type: 'save'}));
 });
-document.querySelector('#discard-button').addEventListener('click', () => {
-  discardDialog.close();
-  leaveEditor(true);
-});
-discardDialog.addEventListener('cancel', () => setTimeout(() => source.focus()));
-discardDialog.addEventListener('click', (event) => {
-  if (event.target === discardDialog) {
-    discardDialog.close();
-    source.focus();
+document.querySelector('#save-button').addEventListener('click', () => {
+  if (socket?.readyState === WebSocket.OPEN) {
+    setStatus('正在保存…', 'connected');
+    socket.send(JSON.stringify({type: 'save'}));
   }
 });
-document.querySelector('.format-tools').addEventListener('click', (event) => {
+document.querySelector('.format-tools').addEventListener('click', event => {
   const action = event.target.closest('button')?.dataset.format;
-  if (!action) return;
+  if (!action || source.disabled) return;
   if (action === 'heading') prefixLines('## ');
   if (action === 'bold') wrapSelection('**');
   if (action === 'italic') wrapSelection('_');
@@ -1571,41 +1812,28 @@ document.querySelector('.format-tools').addEventListener('click', (event) => {
   if (action === 'list') prefixLines('- ');
   if (action === 'task') prefixLines('- [ ] ');
 });
-source.addEventListener('input', schedulePreview);
+source.addEventListener('input', syncTextareaChange);
 source.addEventListener('scroll', syncPreviewFromSource, {passive: true});
 preview.addEventListener('load', () => {
   preview.contentWindow?.addEventListener('scroll', syncSourceFromPreview, {passive: true});
   syncPreviewFromSource();
 });
-source.addEventListener('keydown', (event) => {
+source.addEventListener('keydown', event => {
   if (event.key === 'Tab') {
     event.preventDefault();
     source.setRangeText('  ', source.selectionStart, source.selectionEnd, 'end');
-    schedulePreview();
+    syncTextareaChange();
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     document.querySelector('#save-button').click();
   }
 });
-document.querySelector('#save-button').addEventListener('click', async () => {
-  status.textContent = '正在保存…';
-  try {
-    const response = await fetch(`${location.pathname}?mode=raw`, {
-      method: 'PUT',
-      headers: {'Content-Type': 'text/markdown; charset=utf-8'},
-      body: source.value
-    });
-    if (!response.ok) throw new Error(await response.text());
-    original = source.value;
-    status.textContent = '已保存';
-    setTimeout(() => location.reload(), 250);
-  } catch (error) {
-    status.textContent = `保存失败：${error.message}`;
+window.addEventListener('beforeunload', event => {
+  if (editing && (pending.size > 0 || !synced)) {
+    event.preventDefault();
+    event.returnValue = '';
   }
-});
-window.addEventListener('beforeunload', (event) => {
-  if (source.value !== original) { event.preventDefault(); event.returnValue = ''; }
 });
 buildViewerTools();
 "#;
@@ -1708,6 +1936,7 @@ mod tests {
             Some(PortConfig {
                 port: 8080,
                 fallback_to_random: true,
+                pid_file: None,
             })
         );
         assert_eq!(
@@ -1715,8 +1944,27 @@ mod tests {
             Some(PortConfig {
                 port: 3000,
                 fallback_to_random: false,
+                pid_file: None,
             })
         );
+        assert_eq!(
+            parse_args(
+                vec![
+                    "-pid".into(),
+                    "/tmp/http.pid".into(),
+                    "-p".into(),
+                    "9000".into()
+                ]
+                .into_iter()
+            )
+            .unwrap(),
+            Some(PortConfig {
+                port: 9000,
+                fallback_to_random: false,
+                pid_file: Some(PathBuf::from("/tmp/http.pid")),
+            })
+        );
+        assert!(parse_args(vec!["-pid".into()].into_iter()).is_err());
     }
 
     #[test]
@@ -1726,6 +1974,7 @@ mod tests {
         let listener = bind_listener(&PortConfig {
             port: occupied_port,
             fallback_to_random: true,
+            pid_file: None,
         })
         .unwrap();
 
@@ -1739,10 +1988,24 @@ mod tests {
         let error = bind_listener(&PortConfig {
             port: occupied_port,
             fallback_to_random: false,
+            pid_file: None,
         })
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn writes_the_current_process_id_to_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.pid");
+
+        write_pid_file(&path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("{}\n", std::process::id())
+        );
     }
 
     #[test]
@@ -1795,11 +2058,21 @@ mod tests {
         assert!(page.contains(".preview-pane { border-right:1px solid var(--line); }"));
         assert!(page.contains("source.addEventListener('scroll', syncPreviewFromSource"));
         assert!(page.contains("addEventListener('scroll', syncSourceFromPreview"));
-        assert!(page.contains("<dialog id=\"discard-dialog\""));
-        assert!(page.contains("id=\"keep-editing-button\""));
-        assert!(page.contains("id=\"discard-button\""));
-        assert!(!page.contains("confirm('"));
+        assert!(page.contains(YJS_PATH));
+        assert!(page.contains("id=\"connection-dot\""));
+        assert!(page.contains("id=\"presence\""));
+        assert!(page.contains("退出编辑"));
+        assert!(page.contains("立即保存"));
+        assert!(page.contains("new WebSocket("));
+        assert!(page.contains("Y.encodeStateVector(documentState)"));
+        assert!(page.contains("source.addEventListener('input', syncTextareaChange)"));
+        assert!(page.contains("new DOMParser().parseFromString(markup, 'text/html')"));
+        assert!(page.contains("currentArticle.replaceChildren("));
+        assert!(page.contains("if (revision !== previewRevision) return;"));
+        assert!(!page.contains("preview.srcdoc = await response.text()"));
+        assert!(!page.contains("<dialog id=\"discard-dialog\""));
         assert!(page.contains("href=\"/favicon.svg\""));
+        assert!(YJS_JS.len() > 80_000);
     }
 
     #[test]
@@ -1848,6 +2121,89 @@ mod tests {
             Some("preview")
         );
         assert_eq!(query_parameter("model=raw", "mode"), None);
+    }
+
+    #[test]
+    fn validates_websocket_upgrade_headers() {
+        let headers = RequestHeaders {
+            connection: "keep-alive, upgrade".into(),
+            upgrade: "websocket".into(),
+            websocket_key: "dGhlIHNhbXBsZSBub25jZQ==".into(),
+            websocket_version: "13".into(),
+            ..RequestHeaders::default()
+        };
+        assert!(is_websocket_upgrade(&headers));
+
+        let invalid = RequestHeaders {
+            websocket_key: "not-a-valid-key".into(),
+            ..headers
+        };
+        assert!(!is_websocket_upgrade(&invalid));
+    }
+
+    #[test]
+    fn websocket_collaboration_syncs_and_auto_saves() {
+        use tempfile::tempdir;
+        use tungstenite::{connect, Message};
+        use yrs::updates::decoder::Decode;
+        use yrs::updates::encoder::Encode;
+        use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update};
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("notes.md");
+        fs::write(&path, "hello").unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let hub = CollaborationHub::default();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream, &root, &hub).unwrap();
+        });
+
+        let (mut socket, response) =
+            connect(format!("ws://{address}/notes.md?mode=collab")).unwrap();
+        assert_eq!(response.status(), 101);
+        let client = Doc::with_client_id(42);
+        let text = client.get_or_insert_text("source");
+        let vector = client.transact().state_vector().encode_v1();
+        let mut request = vec![0];
+        request.extend_from_slice(&vector);
+        socket.send(Message::Binary(request.into())).unwrap();
+
+        loop {
+            if let Message::Binary(message) = socket.read().unwrap() {
+                if message.first() == Some(&1) {
+                    client
+                        .transact_mut()
+                        .apply_update(Update::decode_v1(&message[1..]).unwrap())
+                        .unwrap();
+                    break;
+                }
+            }
+        }
+        assert_eq!(text.get_string(&client.transact()), "hello");
+
+        let before = client.transact().state_vector();
+        text.insert(&mut client.transact_mut(), 5, " world");
+        let update = client.transact().encode_state_as_update_v1(&before);
+        let mut change = vec![1];
+        change.extend_from_slice(&7_u32.to_be_bytes());
+        change.extend_from_slice(&update);
+        socket.send(Message::Binary(change.into())).unwrap();
+
+        let mut acknowledged = false;
+        let mut saved = false;
+        while !acknowledged || !saved {
+            if let Message::Text(message) = socket.read().unwrap() {
+                acknowledged |=
+                    message.contains("\"type\":\"ack\"") && message.contains("\"sequence\":7");
+                saved |= message.contains("\"type\":\"saved\"");
+            }
+        }
+        socket.close(None).unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "hello world");
     }
 
     #[test]
