@@ -121,32 +121,6 @@ fn usage() -> &'static str {
     "用法: http [-p PORT]\n\n选项:\n  -p, --port PORT  指定监听端口（默认 8080）\n  -h, --help       显示帮助"
 }
 
-fn find_index_file(directory: &Path) -> io::Result<Option<PathBuf>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("html"))
-        {
-            files.push(entry.path());
-        }
-    }
-    Ok(select_index_file(files))
-}
-
-fn select_index_file(html_files: Vec<PathBuf>) -> Option<PathBuf> {
-    if html_files.len() == 1 {
-        return html_files.into_iter().next();
-    }
-    html_files
-        .into_iter()
-        .find(|path| file_name_eq(path, "index.html"))
-}
-
 fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -211,7 +185,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
         None => return send_text(&mut stream, 403, "Forbidden", "禁止访问\n", head_only),
     };
 
-    let mut canonical = match fs::canonicalize(root.join(&relative)) {
+    let canonical = match fs::canonicalize(root.join(&relative)) {
         Ok(path) if path.starts_with(root) => path,
         Ok(_) => return send_text(&mut stream, 403, "Forbidden", "禁止访问\n", head_only),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -221,7 +195,7 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     };
 
-    let mut metadata = fs::metadata(&canonical)?;
+    let metadata = fs::metadata(&canonical)?;
     if metadata.is_dir() {
         if !request_path.ends_with('/') {
             let location = if query.is_empty() {
@@ -231,20 +205,8 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
             };
             return send_redirect(&mut stream, &location);
         }
-        if !should_use_directory_index(&relative) {
-            let body = render_directory_page(root, &canonical)?;
-            return send_html(&mut stream, &body, head_only);
-        }
-        match find_index_file(&canonical)? {
-            Some(index) => {
-                canonical = index;
-                metadata = fs::metadata(&canonical)?;
-            }
-            None => {
-                let body = render_directory_page(root, &canonical)?;
-                return send_html(&mut stream, &body, head_only);
-            }
-        }
+        let body = render_directory_page(root, &canonical)?;
+        return send_html(&mut stream, &body, head_only);
     }
     if !metadata.is_file() {
         let body = render_not_found_page(&decoded);
@@ -309,6 +271,16 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
             &canonical,
             metadata.len(),
             "text/plain; charset=utf-8",
+            head_only,
+        );
+    }
+
+    if has_extension(&canonical, "html") || has_extension(&canonical, "htm") {
+        return send_file(
+            &mut stream,
+            &canonical,
+            metadata.len(),
+            mime_type(&canonical),
             head_only,
         );
     }
@@ -382,10 +354,6 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
         mime_type(&canonical),
         head_only,
     )
-}
-
-fn should_use_directory_index(relative: &Path) -> bool {
-    !relative.as_os_str().is_empty()
 }
 
 fn send_file(
@@ -1139,12 +1107,6 @@ fn has_extension(path: &Path, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
-fn file_name_eq(path: &Path, expected: &str) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
-}
-
 const NOT_FOUND_CSS: &str = r#"
 :root { color-scheme:light dark; --canvas:#f3f5fb; --surface:#fff; --ink:#202334; --muted:#6f7487; --line:#dce0eb; --accent:#5b5bd6; --accent-dark:#4545bb; --accent-soft:#e8e8ff; --shadow:rgba(49,53,87,.14); }
 * { box-sizing:border-box; }
@@ -1796,41 +1758,6 @@ mod tests {
             Some("/hello world.txt")
         );
         assert!(percent_decode("/%zz").is_none());
-    }
-
-    #[test]
-    fn selects_the_only_html_file_for_root() {
-        let selected = select_index_file(vec![PathBuf::from("site.html")]);
-        assert_eq!(selected, Some(PathBuf::from("site.html")));
-    }
-
-    #[test]
-    fn selects_index_when_there_are_multiple_html_files() {
-        let selected = select_index_file(vec![
-            PathBuf::from("about.html"),
-            PathBuf::from("index.html"),
-        ]);
-        assert_eq!(selected, Some(PathBuf::from("index.html")));
-    }
-
-    #[test]
-    fn does_not_select_root_when_multiple_html_files_have_no_index() {
-        let selected = select_index_file(vec![
-            PathBuf::from("about.html"),
-            PathBuf::from("home.html"),
-        ]);
-        assert_eq!(selected, None);
-    }
-
-    #[test]
-    fn does_not_select_markdown_as_an_index() {
-        assert_eq!(select_index_file(Vec::new()), None);
-    }
-
-    #[test]
-    fn root_always_uses_directory_listing() {
-        assert!(!should_use_directory_index(Path::new("")));
-        assert!(should_use_directory_index(Path::new("docs")));
     }
 
     #[test]
