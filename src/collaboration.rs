@@ -3,8 +3,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tungstenite::error::Error as WebSocketError;
@@ -17,6 +18,7 @@ const TEXT_NAME: &str = "source";
 const SYNC_STATE_VECTOR: u8 = 0;
 const SYNC_UPDATE: u8 = 1;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+static NEXT_ROOM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Default)]
 pub struct CollaborationHub {
@@ -68,6 +70,7 @@ enum SaveCommand {
 }
 
 struct Room {
+    id: String,
     path: PathBuf,
     registry: Weak<RoomRegistry>,
     inner: Mutex<RoomState>,
@@ -92,6 +95,7 @@ pub struct RoomConnection {
 struct ClientControl {
     #[serde(rename = "type")]
     kind: String,
+    id: Option<String>,
 }
 
 impl Room {
@@ -103,6 +107,7 @@ impl Room {
         }
         let (save_tx, save_rx) = mpsc::channel();
         let room = Arc::new(Self {
+            id: new_room_id(),
             path,
             registry,
             inner: Mutex::new(RoomState {
@@ -129,6 +134,10 @@ impl Room {
             let vector = state.doc.transact().state_vector().encode_v1();
             (client_id, vector)
         };
+        self.send_to(
+            client_id,
+            Outbound::Text(serde_json::json!({"type": "room", "id": self.id}).to_string()),
+        );
         self.send_to(
             client_id,
             Outbound::Binary(frame(SYNC_STATE_VECTOR, &state_vector)),
@@ -213,14 +222,23 @@ impl Room {
         }
     }
 
-    fn handle_text(&self, client_id: u64, payload: &str) {
+    fn handle_text(&self, client_id: u64, payload: &str) -> bool {
         match serde_json::from_str::<ClientControl>(payload) {
+            Ok(control)
+                if control.kind == "room-ready" && control.id.as_deref() == Some(&self.id) =>
+            {
+                true
+            }
             Ok(control) if control.kind == "save" => {
                 if let Err(error) = self.flush() {
                     self.send_error(client_id, &format!("保存失败：{error}"));
                 }
+                false
             }
-            _ => self.send_error(client_id, "未知的控制消息"),
+            _ => {
+                self.send_error(client_id, "未知的控制消息");
+                false
+            }
         }
     }
 
@@ -398,6 +416,7 @@ impl RoomConnection {
             .max_frame_size(Some(max_message_size));
         let mut socket =
             WebSocket::from_partially_read(stream, partially_read, Role::Server, Some(config));
+        let mut room_ready = false;
 
         loop {
             while let Ok(message) = self.receiver.try_recv() {
@@ -412,10 +431,17 @@ impl RoomConnection {
 
             match socket.read() {
                 Ok(Message::Binary(bytes)) => {
-                    self.room
-                        .handle_binary(self.client_id, &bytes, max_document_size);
+                    if room_ready {
+                        self.room
+                            .handle_binary(self.client_id, &bytes, max_document_size);
+                    } else {
+                        self.room
+                            .send_error(self.client_id, "协作协议已更新，请刷新页面后重试");
+                    }
                 }
-                Ok(Message::Text(text)) => self.room.handle_text(self.client_id, &text),
+                Ok(Message::Text(text)) => {
+                    room_ready |= self.room.handle_text(self.client_id, &text);
+                }
                 Ok(Message::Close(_)) => return Ok(()),
                 Ok(_) => {}
                 Err(WebSocketError::Io(error))
@@ -442,6 +468,15 @@ fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
     frame.push(kind);
     frame.extend_from_slice(payload);
     frame
+}
+
+fn new_room_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_ROOM_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{timestamp:x}-{:x}-{sequence:x}", std::process::id())
 }
 
 fn broadcast_to(recipients: Vec<mpsc::Sender<Outbound>>, message: Outbound) {
@@ -601,5 +636,26 @@ mod tests {
         assert!(hub.replace_if_active(&path, "new value").unwrap());
         connection.room.flush().unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "new value");
+    }
+
+    #[test]
+    fn recreated_room_gets_a_new_identity() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("notes.md");
+        fs::write(&path, "same text").unwrap();
+        let hub = CollaborationHub::default();
+
+        let first = hub.connect(&path, "same text").unwrap();
+        let first_id = first.room.id.clone();
+        drop(first);
+
+        let second = hub.connect(&path, "same text").unwrap();
+        assert_ne!(first_id, second.room.id);
+        assert!(matches!(
+            second.receiver.recv().unwrap(),
+            Outbound::Text(message)
+                if message.contains("\"type\":\"room\"")
+                    && message.contains(&second.room.id)
+        ));
     }
 }

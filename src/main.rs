@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
-use pulldown_cmark::{html, Event, Options, Parser};
+use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
@@ -1206,10 +1206,48 @@ fn markdown_options() -> Options {
 
 fn render_markdown_article(markdown: &str) -> String {
     // Embedded HTML is shown as text so untrusted Markdown cannot inject scripts.
-    let parser = Parser::new_ext(markdown, markdown_options()).map(|event| match event {
-        Event::Html(value) | Event::InlineHtml(value) => Event::Text(value),
-        event => event,
-    });
+    let mut source_byte = 0;
+    let mut source_utf16 = 0;
+    let parser = Parser::new_ext(markdown, markdown_options())
+        .into_offset_iter()
+        .flat_map(|(event, range)| {
+            let is_anchor = matches!(
+                &event,
+                Event::Start(
+                    Tag::Paragraph
+                        | Tag::Heading { .. }
+                        | Tag::BlockQuote(_)
+                        | Tag::CodeBlock(_)
+                        | Tag::List(_)
+                        | Tag::FootnoteDefinition(_)
+                        | Tag::DefinitionList
+                        | Tag::Table(_)
+                ) | Event::Rule
+                    | Event::Html(_)
+            );
+            let event = match event {
+                Event::Html(value) | Event::InlineHtml(value) => Event::Text(value),
+                event => event,
+            };
+            let mut events = Vec::with_capacity(if is_anchor { 2 } else { 1 });
+            if is_anchor {
+                // JavaScript string offsets use UTF-16 code units rather than UTF-8 bytes.
+                // Block starts are encountered in source order, so this stays linear even
+                // for large collaborative documents.
+                if range.start >= source_byte {
+                    source_utf16 += markdown[source_byte..range.start].encode_utf16().count();
+                    source_byte = range.start;
+                }
+                events.push(Event::Html(CowStr::Boxed(
+                    format!(
+                        "<span class=\"sync-anchor\" data-source-offset=\"{source_utf16}\" aria-hidden=\"true\"></span>"
+                    )
+                    .into_boxed_str(),
+                )));
+            }
+            events.push(event);
+            events
+        });
     let mut article = String::new();
     html::push_html(&mut article, parser);
     article
@@ -1528,6 +1566,7 @@ sup { line-height:0; }
 #preview { width:100%; height:100%; border:0; background:var(--paper); }
 .preview-body { min-height:100vh; }
 main.preview-paper { width:100%; margin:0; padding:2rem; border:0; border-radius:0; box-shadow:none; }
+.sync-anchor { display:block; overflow:hidden; width:0; height:0; pointer-events:none; }
 body.editing { overflow:hidden; }
 @media (max-width:900px) { .reader-layout { display:block; } #toc { display:none; } }
 @media (max-width:700px) { html { font-size:16px; } .reader-layout { display:block; width:100%; margin:0; } main.paper { padding:1.5rem 1rem 3rem; border-width:0; border-radius:0; box-shadow:none; } .topbar { padding-inline:.7rem; } .mark { display:none; } .editor-panes { grid-template-columns:1fr; grid-template-rows:1fr 1fr; } .preview-pane { border-right:0; border-bottom:1px solid var(--line); } .collaboration-status { margin-left:auto; } #save-status { display:none; } }
@@ -1545,12 +1584,17 @@ const presence = document.querySelector('#presence');
 const connectionDot = document.querySelector('#connection-dot');
 const LOCAL_ORIGIN = Symbol('local-input');
 const REMOTE_ORIGIN = Symbol('remote-update');
-const documentState = new Y.Doc();
-const sharedText = documentState.getText('source');
+let documentState = new Y.Doc();
+let sharedText = documentState.getText('source');
 let socket, reconnectTimer, previewTimer;
+let roomId = null;
 let reconnectDelay = 400;
 let previewRevision = 0;
 let scrollSyncLocked = false;
+let sourceScrollMap;
+let scrollMapFrame;
+let scrollAnchors = [];
+let previewResizeObserver;
 let editing = false;
 let synced = false;
 let exitRequested = false;
@@ -1579,21 +1623,107 @@ function withScrollLock(callback) {
   callback();
   requestAnimationFrame(() => { scrollSyncLocked = false; });
 }
+function documentHeight(doc) {
+  return Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
+}
+function interpolateScroll(value, from, to) {
+  if (scrollAnchors.length < 2) return null;
+  const points = scrollAnchors.slice().sort((left, right) => left[from] - right[from]);
+  if (value <= points[0][from]) return points[0][to];
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const next = points[index];
+    if (value > next[from]) continue;
+    const distance = next[from] - previous[from];
+    if (distance <= 0) return next[to];
+    return previous[to] + (next[to] - previous[to]) * (value - previous[from]) / distance;
+  }
+  return points[points.length - 1][to];
+}
+function rebuildScrollMap() {
+  const win = preview.contentWindow;
+  const doc = preview.contentDocument;
+  if (!win || !doc || !source.clientWidth) return;
+  const previewAnchors = Array.from(doc.querySelectorAll('.sync-anchor[data-source-offset]'));
+  const offsets = [...new Set(previewAnchors.map(anchor => Number(anchor.dataset.sourceOffset)))]
+    .filter(offset => Number.isFinite(offset) && offset >= 0 && offset <= source.value.length)
+    .sort((left, right) => left - right);
+
+  sourceScrollMap ||= document.body.appendChild(document.createElement('div'));
+  sourceScrollMap.setAttribute('aria-hidden', 'true');
+  const style = getComputedStyle(source);
+  Object.assign(sourceScrollMap.style, {
+    position: 'fixed', visibility: 'hidden', pointerEvents: 'none', left: '-100000px', top: '0',
+    width: `${source.clientWidth}px`, height: 'auto', boxSizing: 'border-box', border: '0',
+    padding: style.padding, font: style.font, lineHeight: style.lineHeight,
+    letterSpacing: style.letterSpacing, whiteSpace: 'pre-wrap', overflowWrap: 'break-word',
+    wordBreak: style.wordBreak, tabSize: style.tabSize
+  });
+  sourceScrollMap.replaceChildren();
+  const sourceMarkers = new Map();
+  let cursor = 0;
+  offsets.forEach(offset => {
+    sourceScrollMap.append(document.createTextNode(source.value.slice(cursor, offset)));
+    const marker = document.createElement('i');
+    marker.style.cssText = 'display:inline-block;width:0;height:0;overflow:hidden';
+    sourceScrollMap.append(marker);
+    sourceMarkers.set(offset, marker);
+    cursor = offset;
+  });
+  sourceScrollMap.append(document.createTextNode(source.value.slice(cursor) + '\u200b'));
+  const mirrorTop = sourceScrollMap.getBoundingClientRect().top;
+  const uniqueAnchors = new Map();
+  previewAnchors.forEach(anchor => {
+    const offset = Number(anchor.dataset.sourceOffset);
+    if (uniqueAnchors.has(offset) || !sourceMarkers.has(offset)) return;
+    uniqueAnchors.set(offset, {
+      source: sourceMarkers.get(offset).getBoundingClientRect().top - mirrorTop,
+      preview: anchor.getBoundingClientRect().top + win.scrollY
+    });
+  });
+  scrollAnchors = [
+    {source: 0, preview: 0},
+    ...uniqueAnchors.values(),
+    {source: source.scrollHeight, preview: documentHeight(doc)}
+  ];
+}
+function scheduleScrollMapRebuild(syncAfter = true) {
+  cancelAnimationFrame(scrollMapFrame);
+  scrollMapFrame = requestAnimationFrame(() => {
+    rebuildScrollMap();
+    if (syncAfter) syncPreviewFromSource();
+  });
+}
 function syncPreviewFromSource() {
   const win = preview.contentWindow;
   const doc = preview.contentDocument;
   if (!win || !doc) return;
-  const ratio = scrollRatio(source.scrollTop, source.scrollHeight, source.clientHeight);
-  const height = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-  withScrollLock(() => win.scrollTo(0, ratio * Math.max(0, height - win.innerHeight)));
+  const sourceCenter = source.scrollTop + source.clientHeight / 2;
+  const mappedCenter = interpolateScroll(sourceCenter, 'source', 'preview');
+  const sourceMax = Math.max(0, source.scrollHeight - source.clientHeight);
+  const previewMax = Math.max(0, documentHeight(doc) - win.innerHeight);
+  const fallback = scrollRatio(source.scrollTop, source.scrollHeight, source.clientHeight) * previewMax;
+  let target = mappedCenter === null ? fallback : mappedCenter - win.innerHeight / 2;
+  if (source.scrollTop <= 0) target = 0;
+  else if (source.scrollTop >= sourceMax - 1) target = previewMax;
+  withScrollLock(() => win.scrollTo(0, target));
 }
 function syncSourceFromPreview() {
   const win = preview.contentWindow;
   const doc = preview.contentDocument;
   if (!win || !doc) return;
-  const height = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-  const ratio = scrollRatio(win.scrollY, height, win.innerHeight);
-  withScrollLock(() => { source.scrollTop = ratio * Math.max(0, source.scrollHeight - source.clientHeight); });
+  const previewCenter = win.scrollY + win.innerHeight / 2;
+  const mappedCenter = interpolateScroll(previewCenter, 'preview', 'source');
+  const ratio = scrollRatio(win.scrollY, documentHeight(doc), win.innerHeight);
+  const fallback = ratio * Math.max(0, source.scrollHeight - source.clientHeight);
+  const previewMax = Math.max(0, documentHeight(doc) - win.innerHeight);
+  const sourceMax = Math.max(0, source.scrollHeight - source.clientHeight);
+  let target = mappedCenter === null ? fallback : mappedCenter - source.clientHeight / 2;
+  if (win.scrollY <= 0) target = 0;
+  else if (win.scrollY >= previewMax - 1) target = sourceMax;
+  withScrollLock(() => {
+    source.scrollTop = target;
+  });
 }
 function buildViewerTools() {
   const toc = document.querySelector('#toc');
@@ -1639,6 +1769,7 @@ async function updatePreview() {
     currentArticle.replaceChildren(
       ...Array.from(nextArticle.childNodes, node => previewDocument.importNode(node, true))
     );
+    scheduleScrollMapRebuild();
   } catch (error) {
     if (revision !== previewRevision) return;
     setStatus(`预览失败：${error.message}`, 'error');
@@ -1662,6 +1793,20 @@ function sendUpdate(update) {
   pending.add(sequence);
   socket.send(binaryFrame(1, update, sequence));
   refreshStatus();
+}
+function observeDocumentState() {
+  documentState.on('update', (update, origin) => {
+    if (origin !== REMOTE_ORIGIN) sendUpdate(update);
+  });
+}
+function resetDocumentState() {
+  documentState.destroy();
+  documentState = new Y.Doc();
+  sharedText = documentState.getText('source');
+  pending.clear();
+  latestGeneration = 0;
+  savedGeneration = 0;
+  observeDocumentState();
 }
 function restoreSelection(startPosition, endPosition) {
   const start = startPosition && Y.createAbsolutePositionFromRelativePosition(startPosition, documentState);
@@ -1701,7 +1846,12 @@ function finishExitIfReady() {
 function handleControl(payload) {
   let message;
   try { message = JSON.parse(payload); } catch (_) { return; }
-  if (message.type === 'presence') presence.textContent = `${message.count} 人在线`;
+  if (message.type === 'room') {
+    if (roomId !== null && roomId !== message.id) resetDocumentState();
+    roomId = message.id;
+    socket?.send(JSON.stringify({type: 'room-ready', id: roomId}));
+    socket?.send(binaryFrame(0, Y.encodeStateVector(documentState)));
+  } else if (message.type === 'presence') presence.textContent = `${message.count} 人在线`;
   else if (message.type === 'ack') {
     pending.delete(message.sequence);
     latestGeneration = Math.max(latestGeneration, message.generation || 0);
@@ -1720,7 +1870,6 @@ function connect() {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   socket = new WebSocket(`${scheme}//${location.host}${location.pathname}?mode=collab`);
   socket.binaryType = 'arraybuffer';
-  socket.addEventListener('open', () => socket.send(binaryFrame(0, Y.encodeStateVector(documentState))));
   socket.addEventListener('message', event => {
     if (typeof event.data === 'string') handleControl(event.data);
     else handleBinary(event.data);
@@ -1728,6 +1877,7 @@ function connect() {
   socket.addEventListener('close', () => {
     synced = false;
     source.disabled = true;
+    pending.clear();
     if (!editing || exitRequested) return;
     setStatus('连接已断开，正在重连…', 'error');
     reconnectTimer = setTimeout(connect, reconnectDelay);
@@ -1761,9 +1911,7 @@ function syncTextareaChange() {
   }, LOCAL_ORIGIN);
   schedulePreview();
 }
-documentState.on('update', (update, origin) => {
-  if (origin !== REMOTE_ORIGIN) sendUpdate(update);
-});
+observeDocumentState();
 function wrapSelection(prefix, suffix = prefix, placeholder = '文本') {
   const start = source.selectionStart;
   const end = source.selectionEnd;
@@ -1815,9 +1963,21 @@ document.querySelector('.format-tools').addEventListener('click', event => {
 source.addEventListener('input', syncTextareaChange);
 source.addEventListener('scroll', syncPreviewFromSource, {passive: true});
 preview.addEventListener('load', () => {
-  preview.contentWindow?.addEventListener('scroll', syncSourceFromPreview, {passive: true});
-  syncPreviewFromSource();
+  const win = preview.contentWindow;
+  const doc = preview.contentDocument;
+  win?.addEventListener('scroll', syncSourceFromPreview, {passive: true});
+  doc?.addEventListener('load', event => {
+    if (event.target instanceof win.HTMLImageElement) scheduleScrollMapRebuild();
+  }, true);
+  previewResizeObserver?.disconnect();
+  const article = doc?.querySelector('article');
+  if (article && win?.ResizeObserver) {
+    previewResizeObserver = new win.ResizeObserver(() => scheduleScrollMapRebuild());
+    previewResizeObserver.observe(article);
+  }
+  scheduleScrollMapRebuild();
 });
+new ResizeObserver(() => scheduleScrollMapRebuild()).observe(source);
 source.addEventListener('keydown', event => {
   if (event.key === 'Tab') {
     event.preventDefault();
@@ -2111,6 +2271,15 @@ mod tests {
     }
 
     #[test]
+    fn adds_utf16_source_anchors_to_markdown_blocks() {
+        let article = render_markdown_article("你好\n\n## title");
+
+        assert!(article.contains("data-source-offset=\"0\""));
+        assert!(article.contains("data-source-offset=\"4\""));
+        assert!(article.contains("<h2>title</h2>"));
+    }
+
+    #[test]
     fn reads_mode_from_query_string() {
         assert_eq!(
             query_parameter("download=1&mode=raw", "mode").as_deref(),
@@ -2169,6 +2338,21 @@ mod tests {
         let vector = client.transact().state_vector().encode_v1();
         let mut request = vec![0];
         request.extend_from_slice(&vector);
+        let room_id = loop {
+            if let Message::Text(message) = socket.read().unwrap() {
+                let control: serde_json::Value = serde_json::from_str(&message).unwrap();
+                if control["type"] == "room" {
+                    break control["id"].as_str().unwrap().to_owned();
+                }
+            }
+        };
+        socket
+            .send(Message::Text(
+                serde_json::json!({"type": "room-ready", "id": room_id})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
         socket.send(Message::Binary(request.into())).unwrap();
 
         loop {
