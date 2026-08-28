@@ -215,7 +215,8 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
         Ok(path) if path.starts_with(root) => path,
         Ok(_) => return send_text(&mut stream, 403, "Forbidden", "禁止访问\n", head_only),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return send_text(&mut stream, 404, "Not Found", "文件不存在\n", head_only)
+            let body = render_not_found_page(&decoded);
+            return send_html_status(&mut stream, 404, "Not Found", &body, head_only);
         }
         Err(error) => return Err(error),
     };
@@ -246,7 +247,8 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
         }
     }
     if !metadata.is_file() {
-        return send_text(&mut stream, 404, "Not Found", "文件不存在\n", head_only);
+        let body = render_not_found_page(&decoded);
+        return send_html_status(&mut stream, 404, "Not Found", &body, head_only);
     }
 
     if method == "POST" {
@@ -464,6 +466,24 @@ fn send_html(stream: &mut TcpStream, body: &str, head_only: bool) -> io::Result<
     )
 }
 
+fn send_html_status(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+    head_only: bool,
+) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n",
+        body.len(),
+    )?;
+    if !head_only {
+        stream.write_all(body.as_bytes())?;
+    }
+    Ok(())
+}
+
 fn send_content(
     stream: &mut TcpStream,
     body: &[u8],
@@ -517,6 +537,17 @@ fn render_site_icon(root: &Path) -> String {
     let initial = escape_html(&initial);
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><rect width=\"64\" height=\"64\" rx=\"15\" fill=\"{color}\"/><circle cx=\"51\" cy=\"13\" r=\"5\" fill=\"#fff\" opacity=\".22\"/><text x=\"32\" y=\"42\" text-anchor=\"middle\" fill=\"#fff\" font-family=\"ui-sans-serif,system-ui,sans-serif\" font-size=\"32\" font-weight=\"750\">{initial}</text></svg>"
+    )
+}
+
+fn render_not_found_page(request_path: &str) -> String {
+    let path = escape_html(if request_path.is_empty() {
+        "/"
+    } else {
+        request_path
+    });
+    format!(
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>文件未找到 · 404</title>\n<style>{NOT_FOUND_CSS}</style>\n</head>\n<body>\n<main><section class=\"message\" aria-labelledby=\"not-found-title\"><p class=\"status\"><span></span>HTTP 404</p><h1 id=\"not-found-title\">这个文件<br>不在这里</h1><p class=\"explanation\">它可能被移动、重命名，或者这个地址原本就不存在。</p><div class=\"requested\"><span>请求路径</span><code>{path}</code></div><nav aria-label=\"后续操作\"><a class=\"primary\" href=\"/\">浏览根目录 <span aria-hidden=\"true\">→</span></a><a class=\"secondary\" href=\".\">返回上一级</a></nav></section><div class=\"visual\" aria-hidden=\"true\"><div class=\"file-card\"><div class=\"fold\"></div><span class=\"file-label\">FILE</span><strong>404</strong><div class=\"rule long\"></div><div class=\"rule short\"></div><div class=\"tear\"><i></i><i></i><i></i><i></i><i></i></div></div><p>RESOURCE / MISSING</p></div></main>\n</body>\n</html>"
     )
 }
 
@@ -1113,6 +1144,45 @@ fn file_name_eq(path: &Path, expected: &str) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case(expected))
 }
+
+const NOT_FOUND_CSS: &str = r#"
+:root { color-scheme:light dark; --canvas:#f3f5fb; --surface:#fff; --ink:#202334; --muted:#6f7487; --line:#dce0eb; --accent:#5b5bd6; --accent-dark:#4545bb; --accent-soft:#e8e8ff; --shadow:rgba(49,53,87,.14); }
+* { box-sizing:border-box; }
+html,body { min-height:100%; }
+body { display:grid; place-items:center; margin:0; padding:clamp(1.25rem,4vw,3rem); color:var(--ink); background:radial-gradient(circle at 14% 12%,rgba(91,91,214,.11),transparent 26rem),linear-gradient(135deg,transparent 0 49.7%,rgba(91,91,214,.045) 49.8% 50.2%,transparent 50.3%) var(--canvas); background-size:auto,32px 32px; font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif; }
+main { display:grid; grid-template-columns:minmax(0,1.08fr) minmax(18rem,.92fr); align-items:center; width:min(100%,980px); min-height:min(650px,calc(100vh - 6rem)); overflow:hidden; border:1px solid var(--line); border-radius:1.5rem; background:var(--surface); box-shadow:0 28px 80px var(--shadow); }
+.message { padding:clamp(2rem,7vw,5.5rem); }
+.status { display:flex; align-items:center; gap:.6rem; margin:0 0 2rem; color:var(--accent); font:750 .72rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.14em; }
+.status span { width:.55rem; height:.55rem; border-radius:50%; background:var(--accent); box-shadow:0 0 0 .35rem var(--accent-soft); }
+h1 { max-width:10ch; margin:0; font:720 clamp(2.25rem,4.2vw,3.5rem)/1.08 ui-rounded,"SF Pro Rounded","Nunito Sans",Inter,ui-sans-serif,sans-serif; letter-spacing:-.035em; }
+.explanation { max-width:27rem; margin:1.65rem 0 0; color:var(--muted); font-size:clamp(.95rem,1.4vw,1.05rem); line-height:1.75; }
+.requested { display:grid; gap:.55rem; margin:2rem 0 2.25rem; }
+.requested span { color:var(--muted); font:650 .68rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.1em; }
+.requested code { display:block; width:100%; max-width:30rem; padding:.8rem 1rem; border:1px solid var(--line); border-radius:.65rem; color:var(--ink); background:var(--canvas); font:550 .82rem/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; white-space:pre-wrap; }
+nav { display:flex; align-items:center; gap:1rem; flex-wrap:wrap; }
+nav a { display:inline-flex; align-items:center; justify-content:center; min-height:2.9rem; border-radius:.7rem; font-size:.86rem; font-weight:700; text-decoration:none; transition:transform .16s ease,background .16s ease,border-color .16s ease; }
+.primary { gap:1.2rem; padding:.75rem 1.05rem  .75rem 1.2rem; color:#fff; background:var(--accent); box-shadow:0 8px 22px rgba(91,91,214,.24); }
+.primary:hover { background:var(--accent-dark); transform:translateY(-2px); }
+.primary span { font-size:1.1rem; }
+.secondary { padding:.75rem .35rem; color:var(--muted); }
+.secondary:hover { color:var(--accent); }
+.visual { align-self:stretch; display:grid; place-items:center; align-content:center; gap:2rem; min-width:0; padding:3rem; overflow:hidden; border-left:1px solid var(--line); background:linear-gradient(145deg,var(--accent-soft),color-mix(in srgb,var(--surface) 65%,var(--accent-soft))); }
+.visual>p { margin:0; color:var(--accent); font:700 .66rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.18em; }
+.file-card { position:relative; width:min(18rem,70vw); aspect-ratio:4/5; padding:2rem; color:var(--ink); background:var(--surface); filter:drop-shadow(0 22px 24px rgba(54,55,112,.18)); transform:rotate(3deg); }
+.file-card::after { position:absolute; inset:.75rem; border:1px solid var(--line); content:""; pointer-events:none; }
+.fold { position:absolute; top:0; right:0; width:4rem; height:4rem; background:linear-gradient(45deg,var(--accent-soft) 49%,var(--line) 50% 51%,transparent 52%); }
+.file-label { position:relative; display:inline-block; z-index:1; margin-top:1.2rem; padding:.35rem .55rem; color:#fff; background:var(--accent); font:750 .65rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.12em; }
+.file-card strong { position:relative; z-index:1; display:block; margin:2.2rem 0 2.5rem; color:var(--accent); font:800 clamp(4.5rem,10vw,7rem)/.8 ui-rounded,"SF Pro Rounded",Inter,sans-serif; letter-spacing:-.08em; }
+.rule { position:relative; z-index:1; height:.65rem; margin-top:.8rem; border-radius:1rem; background:var(--line); }
+.rule.long { width:75%; }
+.rule.short { width:48%; }
+.tear { position:absolute; right:-1px; bottom:2.2rem; left:-1px; display:flex; align-items:center; justify-content:space-between; border-top:2px dashed var(--accent); }
+.tear i { width:1rem; height:1rem; margin-top:-.5rem; border-radius:50%; background:var(--accent-soft); }
+:focus-visible { outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent); outline-offset:3px; }
+@media (max-width:760px) { body { display:block; padding:0; background:var(--surface); } main { display:block; min-height:100vh; min-height:100dvh; border:0; border-radius:0; box-shadow:none; } .message { padding:3rem 1.5rem 2.5rem; } .status { margin-bottom:1.5rem; } h1 { font-size:clamp(2.35rem,11vw,3.2rem); } .visual { min-height:23rem; border-top:1px solid var(--line); border-left:0; } .file-card { width:12rem; padding:1.5rem; } .file-card strong { margin:1.5rem 0 2rem; font-size:4.5rem; } }
+@media (prefers-color-scheme:dark) { :root { --canvas:#10121a; --surface:#191c27; --ink:#eef0f7; --muted:#9ca2b3; --line:#323746; --accent:#aaa7ff; --accent-dark:#c0bdff; --accent-soft:#292942; --shadow:rgba(0,0,0,.3); } .primary { color:#171826; background:#aaa7ff; box-shadow:0 8px 24px rgba(90,85,190,.22); } .primary:hover { background:#c0bdff; } }
+@media (prefers-reduced-motion:reduce) { nav a { transition:none; } .primary:hover { transform:none; } }
+"#;
 
 const TEXT_CSS: &str = r#"
 :root { color-scheme:light dark; --paper:#f7f8fc; --surface:#fff; --ink:#272a38; --muted:#73788b; --line:#dfe3ee; --accent:#5b5bd6; --accent-soft:#eeeeff; --gutter:#f0f2f8; }
@@ -1815,6 +1885,21 @@ mod tests {
         assert!(icon.contains(">H</text>"));
         assert!(escaped.contains(">&lt;</text>"));
         assert!(!escaped.contains("><</text>"));
+    }
+
+    #[test]
+    fn renders_a_styled_and_safe_not_found_page() {
+        let page = render_not_found_page("/missing/<script>.txt");
+
+        assert!(page.starts_with("<!doctype html>"));
+        assert!(page.contains("HTTP 404"));
+        assert!(page.contains("这个文件<br>不在这里"));
+        assert!(page.contains("/missing/&lt;script&gt;.txt"));
+        assert!(!page.contains("<script>.txt"));
+        assert!(page.contains("href=\"/\""));
+        assert!(page.contains("overflow-wrap:anywhere; white-space:pre-wrap"));
+        assert!(!page.contains("text-overflow:ellipsis"));
+        assert!(page.contains("@media (prefers-reduced-motion:reduce)"));
     }
 
     #[test]
