@@ -1885,12 +1885,12 @@ function connect() {
   });
   socket.addEventListener('error', () => setStatus('协作连接失败', 'error'));
 }
-function openEditor() {
+async function openEditor() {
   editing = true;
   reader.hidden = true;
   editor.hidden = false;
   document.body.classList.add('editing');
-  updatePreview();
+  await updatePreview();
   connect();
 }
 function syncTextareaChange() {
@@ -2224,6 +2224,8 @@ mod tests {
         assert!(page.contains("退出编辑"));
         assert!(page.contains("立即保存"));
         assert!(page.contains("new WebSocket("));
+        assert!(page.contains("async function openEditor()"));
+        assert!(page.contains("await updatePreview();\n  connect();"));
         assert!(page.contains("Y.encodeStateVector(documentState)"));
         assert!(page.contains("source.addEventListener('input', syncTextareaChange)"));
         assert!(page.contains("new DOMParser().parseFromString(markup, 'text/html')"));
