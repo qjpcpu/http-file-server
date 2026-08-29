@@ -1520,7 +1520,7 @@ main.paper { width:100%; margin:0; padding:clamp(1.25rem,5vw,4.6rem); border:1px
 #toc { position:sticky; top:5rem; align-self:start; max-height:calc(100vh - 7rem); overflow:auto; padding:.35rem; font-size:.74rem; }
 #toc:empty { display:none; }
 #toc::before { display:block; margin:0 0 .7rem .55rem; color:var(--muted); content:"ON THIS PAGE"; font:700 .62rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.1em; }
-#toc a { display:block; overflow:hidden; padding:.35rem .55rem; border-left:1px solid var(--line); color:var(--muted); text-decoration:none; text-overflow:ellipsis; white-space:nowrap; }
+#toc a { display:block; width:max-content; min-width:100%; padding:.35rem .55rem; border-left:1px solid var(--line); color:var(--muted); text-decoration:none; white-space:nowrap; }
 #toc a[data-level="3"] { padding-left:1.15rem; }
 #toc a:hover { border-color:var(--accent); color:var(--accent); }
 article { max-width:760px; margin:auto; }
@@ -2211,6 +2211,7 @@ mod tests {
         assert!(page.contains("id=\"source\""));
         assert!(page.contains("[hidden] { display:none !important; }"));
         assert!(page.contains(".editor-shell { display:flex; flex-direction:column;"));
+        assert!(page.contains("#toc a { display:block; width:max-content; min-width:100%;"));
         assert!(
             page.find("class=\"pane preview-pane\"").unwrap()
                 < page.find("class=\"pane source-pane\"").unwrap()
