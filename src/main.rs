@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -21,6 +21,9 @@ const DEFAULT_PORT: u16 = 8080;
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 const MAX_TEXT_VIEWER_FILE: u64 = 4 * 1024 * 1024;
 const MAX_DRAWIO_VIEWER_FILE: u64 = 16 * 1024 * 1024;
+const MAX_THUMBNAIL_SOURCE: u64 = 16 * 1024 * 1024;
+const THUMBNAIL_MAX_EDGE: u32 = 128;
+const GALLERY_THUMBNAIL_MAX_EDGE: u32 = 512;
 const DRAWIO_VIEWER_PATH: &str = "/__http_file_server/drawio-viewer-31.3.1.js";
 const DRAWIO_VIEWER_JS: &[u8] = include_bytes!("../assets/drawio-viewer-static-31.3.1.min.js");
 const YJS_PATH: &str = "/__http_file_server/yjs-13.6.32.min.js";
@@ -223,6 +226,8 @@ fn handle_connection(
     let raw_mode = mode.as_deref() == Some("raw");
     let preview_mode = mode.as_deref() == Some("preview");
     let asset_mode = mode.as_deref() == Some("asset");
+    let thumb_mode = mode.as_deref() == Some("thumb");
+    let gallery_thumb_mode = mode.as_deref() == Some("gallery-thumb");
     let collaboration_mode = mode.as_deref() == Some("collab");
     let decoded = match percent_decode(request_path) {
         Some(path) => path,
@@ -370,6 +375,17 @@ fn handle_connection(
             mime_type(&canonical),
             head_only,
         );
+    }
+
+    // Directory listings request a downscaled preview instead of decoding a
+    // full-size photo into a 40px well.
+    if thumb_mode || gallery_thumb_mode {
+        let max_edge = if gallery_thumb_mode {
+            GALLERY_THUMBNAIL_MAX_EDGE
+        } else {
+            THUMBNAIL_MAX_EDGE
+        };
+        return send_image_thumbnail(&mut stream, &canonical, metadata.len(), max_edge, head_only);
     }
 
     if raw_mode {
@@ -675,6 +691,11 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
 
     let directory_count = entries.iter().filter(|entry| entry.is_dir).count();
     let file_count = entries.len() - directory_count;
+    let image_count = entries
+        .iter()
+        .filter(|entry| !entry.is_dir && is_image_file(&entry.path))
+        .count();
+    let gallery_available = should_use_gallery(image_count, file_count);
     let title = relative
         .file_name()
         .and_then(|name| name.to_str())
@@ -703,9 +724,35 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
         } else {
             (file_kind(&entry.path).to_string(), human_size(entry.size))
         };
-        let class = if entry.is_dir { "folder" } else { "file" };
+        let is_image = !entry.is_dir && is_image_file(&entry.path);
+        let thumb = (!entry.is_dir)
+            .then(|| thumbnail_url(&href, &entry.path, entry.size, false))
+            .flatten();
+        let gallery_thumb = gallery_available
+            .then(|| thumbnail_url(&href, &entry.path, entry.size, true))
+            .flatten();
+        let class = match (entry.is_dir, is_image, has_extension(&entry.path, "svg")) {
+            (true, _, _) => "folder",
+            (false, true, true) => "file image vector",
+            (false, true, false) => "file image",
+            (false, false, _) => "file",
+        };
+        let glyph = match (&thumb, &gallery_thumb) {
+            (Some(src), Some(gallery_src)) => format!(
+                "<span class=\"glyph\" aria-hidden=\"true\"><img src=\"{src}\" data-list-src=\"{src}\" data-gallery-src=\"{gallery_src}\" alt=\"\" loading=\"lazy\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
+            ),
+            (Some(src), None) => format!(
+                "<span class=\"glyph\" aria-hidden=\"true\"><img src=\"{src}\" alt=\"\" loading=\"lazy\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
+            ),
+            (None, _) => "<span class=\"glyph\" aria-hidden=\"true\"></span>".to_string(),
+        };
+        let preview = if is_image {
+            format!(" data-preview-src=\"{href}?mode=asset\"")
+        } else {
+            String::new()
+        };
         rows.push_str(&format!(
-            "<a class=\"entry {class}\" href=\"{href}\"><span class=\"glyph\" aria-hidden=\"true\"></span><span class=\"entry-name\">{name}</span><span class=\"kind\">{kind}</span><span class=\"detail\">{detail}</span><span class=\"arrow\" aria-hidden=\"true\">→</span></a>"
+            "<a class=\"entry {class}\" href=\"{href}\"{preview}>{glyph}<span class=\"entry-name\">{name}</span><span class=\"kind\">{kind}</span><span class=\"detail\">{detail}</span><span class=\"arrow\" aria-hidden=\"true\">→</span></a>"
         ));
     }
     if rows.is_empty() {
@@ -713,8 +760,13 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
     }
 
     let title = escape_html(title);
+    let gallery_toggle = if gallery_available {
+        "<button class=\"view-toggle\" id=\"gallery-toggle\" type=\"button\" aria-pressed=\"false\"><span aria-hidden=\"true\">▦</span> Gallery</button>"
+    } else {
+        ""
+    };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}</header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><figure><img alt=\"\"><figcaption></figcaption></figure></div>\n<script>{DIRECTORY_JS}</script>\n</body>\n</html>"
     ))
 }
 
@@ -764,6 +816,97 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{size:.1} {}", UNITS[unit])
     }
+}
+
+fn is_image_file(path: &Path) -> bool {
+    file_kind(path) == "IMAGE"
+}
+
+fn is_raster_image(path: &Path) -> bool {
+    is_image_file(path) && !has_extension(path, "svg")
+}
+
+fn should_use_gallery(image_count: usize, file_count: usize) -> bool {
+    file_count > 0 && image_count > 0
+}
+
+fn thumbnail_url(href: &str, path: &Path, size: u64, gallery_mode: bool) -> Option<String> {
+    if size == 0 || size > MAX_THUMBNAIL_SOURCE || !is_image_file(path) {
+        return None;
+    }
+    if has_extension(path, "svg") {
+        Some(format!("{href}?mode=asset"))
+    } else if gallery_mode {
+        Some(format!("{href}?mode=gallery-thumb"))
+    } else {
+        Some(format!("{href}?mode=thumb"))
+    }
+}
+
+fn send_image_thumbnail(
+    stream: &mut TcpStream,
+    path: &Path,
+    size: u64,
+    max_edge: u32,
+    head_only: bool,
+) -> io::Result<()> {
+    if !is_raster_image(path) {
+        return send_text(
+            stream,
+            415,
+            "Unsupported Media Type",
+            "该文件不支持缩略图\n",
+            head_only,
+        );
+    }
+    if size == 0 || size > MAX_THUMBNAIL_SOURCE {
+        return send_text(
+            stream,
+            413,
+            "Content Too Large",
+            "图片超过 16 MB，无法生成缩略图\n",
+            head_only,
+        );
+    }
+    match render_image_thumbnail(path, max_edge) {
+        Ok((bytes, content_type)) => send_content(stream, &bytes, content_type, head_only),
+        Err(_) => send_text(
+            stream,
+            415,
+            "Unsupported Media Type",
+            "无法生成缩略图\n",
+            head_only,
+        ),
+    }
+}
+
+fn render_image_thumbnail(path: &Path, max_edge: u32) -> io::Result<(Vec<u8>, &'static str)> {
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8_192);
+    limits.max_image_height = Some(8_192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().map_err(image_io_error)?;
+    let thumb = image.thumbnail(max_edge, max_edge);
+    let mut bytes = Vec::new();
+    let mut cursor = Cursor::new(&mut bytes);
+    if thumb.color().has_alpha() {
+        thumb
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(image_io_error)?;
+        Ok((bytes, "image/png"))
+    } else {
+        let rgb = thumb.to_rgb8();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 82)
+            .encode_image(&rgb)
+            .map_err(image_io_error)?;
+        Ok((bytes, "image/jpeg"))
+    }
+}
+
+fn image_io_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 fn file_kind(path: &Path) -> &'static str {
@@ -1462,22 +1605,88 @@ window.onDrawioViewerLoad = () => {
 };
 "#;
 
+const DIRECTORY_JS: &str = r#"
+const galleryToggle = document.querySelector('#gallery-toggle');
+if (galleryToggle) {
+  const listing = document.querySelector('.listing');
+  const thumbnails = listing.querySelectorAll('img[data-gallery-src]');
+  const lightbox = document.querySelector('#image-lightbox');
+  const lightboxImage = lightbox.querySelector('img');
+  const lightboxCaption = lightbox.querySelector('figcaption');
+  const lightboxClose = lightbox.querySelector('.lightbox-close');
+  let previewTrigger = null;
+
+  const closeLightbox = () => {
+    if (lightbox.hidden) return;
+    lightbox.hidden = true;
+    lightboxImage.removeAttribute('src');
+    document.body.classList.remove('lightbox-open');
+    if (previewTrigger) previewTrigger.focus();
+    previewTrigger = null;
+  };
+
+  listing.addEventListener('click', event => {
+    const imageArea = event.target.closest('.entry.image .glyph');
+    if (!listing.classList.contains('gallery') || !imageArea) return;
+    const entry = imageArea.closest('.entry[data-preview-src]');
+    if (!entry) return;
+    event.preventDefault();
+    previewTrigger = entry;
+    const name = entry.querySelector('.entry-name').textContent;
+    lightboxImage.src = entry.dataset.previewSrc;
+    lightboxImage.alt = name;
+    lightboxCaption.textContent = name;
+    lightbox.hidden = false;
+    document.body.classList.add('lightbox-open');
+    lightboxClose.focus();
+  });
+
+  lightboxClose.addEventListener('click', closeLightbox);
+  lightbox.addEventListener('click', event => {
+    if (event.target === lightbox) closeLightbox();
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') closeLightbox();
+  });
+
+  galleryToggle.addEventListener('click', () => {
+    const enabled = listing.classList.toggle('gallery');
+    if (!enabled) closeLightbox();
+    document.body.classList.toggle('gallery-mode', enabled);
+    galleryToggle.setAttribute('aria-pressed', String(enabled));
+    galleryToggle.innerHTML = enabled
+      ? '<span aria-hidden="true">☷</span> 列表'
+      : '<span aria-hidden="true">▦</span> Gallery';
+    thumbnails.forEach(image => {
+      const source = enabled ? image.dataset.gallerySrc : image.dataset.listSrc;
+      if (source && image.getAttribute('src') !== source) image.setAttribute('src', source);
+    });
+  });
+}
+"#;
+
 const DIRECTORY_CSS: &str = r#"
-:root { color-scheme:light dark; --paper:#f7f8fc; --surface:#fff; --ink:#202333; --muted:#73788b; --line:#dfe3ee; --accent:#5b5bd6; --accent-soft:#eeeeff; --folder:#6970e8; }
+:root { color-scheme:light dark; --paper:#f7f8fc; --surface:#fff; --ink:#202333; --muted:#73788b; --line:#dfe3ee; --accent:#5b5bd6; --accent-soft:#eeeeff; --folder:#6970e8; --grid:#e4e7f0; }
 * { box-sizing:border-box; }
+[hidden] { display:none !important; }
 html { font-size:16px; }
 body { min-height:100vh; margin:0; color:var(--ink); background:var(--paper); font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC",sans-serif; }
+body.lightbox-open { overflow:hidden; }
 main { width:min(100% - 2rem,980px); margin:0 auto; padding:clamp(1.5rem,6vw,5rem) 0; }
+.gallery-mode main { width:min(100% - 2rem,1320px); }
 .breadcrumbs { display:flex; align-items:center; gap:.55rem; overflow-x:auto; padding-bottom:1rem; color:var(--muted); font:600 .78rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; scrollbar-width:none; }
 .breadcrumbs a { color:inherit; text-decoration:none; white-space:nowrap; }
 .breadcrumbs a:hover { color:var(--accent); }
 header { position:relative; padding:clamp(1.4rem,4vw,2.5rem); overflow:hidden; border:1px solid var(--line); border-radius:1.1rem 1.1rem 0 0; background:var(--surface); }
 header::after { position:absolute; right:-1.4rem; bottom:-3.2rem; width:9rem; height:7rem; border:1.1rem solid var(--accent-soft); border-radius:1.2rem; content:""; transform:rotate(-8deg); }
+.view-toggle { position:absolute; z-index:2; right:clamp(1rem,3vw,2rem); top:clamp(1rem,3vw,2rem); display:flex; align-items:center; gap:.45rem; min-height:2.35rem; padding:.55rem .8rem; border:1px solid var(--line); border-radius:.65rem; color:var(--ink); background:var(--surface); box-shadow:0 6px 18px rgba(54,59,92,.08); font:700 .75rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
+.view-toggle:hover,.view-toggle[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
+.view-toggle span { font-size:1rem; }
 .eyebrow { margin:0 0 .7rem; color:var(--accent); font:700 .72rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.14em; }
 h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family:"Iowan Old Style","Noto Serif SC","Songti SC",Georgia,serif; font-size:clamp(2rem,6vw,3.8rem); line-height:1.08; letter-spacing:-.035em; }
 .summary { position:relative; z-index:1; margin:.8rem 0 0; color:var(--muted); font-size:.88rem; }
 .listing { overflow:hidden; border:1px solid var(--line); border-top:0; border-radius:0 0 1.1rem 1.1rem; background:var(--surface); box-shadow:0 25px 70px rgba(54,59,92,.09); }
-.entry { display:grid; grid-template-columns:2rem minmax(0,1fr) 5rem 6rem 1.5rem; align-items:center; gap:.8rem; min-height:4.15rem; padding:.65rem 1.2rem; border-top:1px solid var(--line); color:var(--ink); text-decoration:none; transition:background .15s ease,padding-left .15s ease; }
+.entry { display:grid; grid-template-columns:2.55rem minmax(0,1fr) 5rem 6rem 1.5rem; align-items:center; gap:.85rem; min-height:4.25rem; padding:.7rem 1.2rem; border-top:1px solid var(--line); color:var(--ink); text-decoration:none; transition:background .15s ease,padding-left .15s ease; }
 .entry:first-child { border-top:0; }
 .entry:hover { padding-left:1.45rem; background:var(--accent-soft); }
 .entry-name { overflow:hidden; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
@@ -1485,17 +1694,40 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .detail { justify-self:end; color:var(--muted); font:500 .75rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .arrow { color:var(--muted); font-size:1.1rem; opacity:0; transform:translateX(-.35rem); transition:opacity .15s ease,transform .15s ease; }
 .entry:hover .arrow { opacity:1; transform:none; }
-.glyph { position:relative; display:block; width:1.4rem; height:1.2rem; border:2px solid var(--muted); border-radius:.18rem; opacity:.75; }
+.glyph { position:relative; justify-self:center; display:block; width:1.4rem; height:1.2rem; border:2px solid var(--muted); border-radius:.18rem; opacity:.75; }
 .folder .glyph { height:1rem; margin-top:.2rem; border:0; border-radius:.18rem; background:var(--folder); opacity:1; }
 .folder .glyph::before { position:absolute; left:.08rem; top:-.28rem; width:.62rem; height:.38rem; border-radius:.18rem .18rem 0 0; background:var(--folder); content:""; }
 .file .glyph::after { position:absolute; right:-2px; top:-2px; width:.42rem; height:.42rem; border-left:2px solid var(--muted); border-bottom:2px solid var(--muted); background:var(--surface); content:""; }
+.entry.image .glyph { width:2.55rem; height:2.55rem; overflow:hidden; border:1px solid var(--line); border-radius:.55rem; background-color:var(--surface); background-image:linear-gradient(45deg,var(--grid) 25%,transparent 25%),linear-gradient(-45deg,var(--grid) 25%,transparent 25%),linear-gradient(45deg,transparent 75%,var(--grid) 75%),linear-gradient(-45deg,transparent 75%,var(--grid) 75%); background-position:0 0,0 5px,5px -5px,-5px 0; background-size:10px 10px; box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--line) 65%,transparent); opacity:1; }
+.entry.image .glyph::after { content:none; }
+.entry.image .glyph img { width:100%; height:100%; object-fit:cover; object-position:center; display:block; pointer-events:none; transition:transform .2s ease; }
+.entry.image:hover .glyph img { transform:scale(1.06); }
+.entry.image.vector .glyph img { object-fit:contain; padding:.2rem; }
+.listing.gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:1rem; padding:1rem; overflow:visible; }
+.gallery .entry { grid-template-columns:minmax(0,1fr) auto; grid-template-rows:11rem auto auto; gap:.65rem .75rem; min-width:0; min-height:0; padding:.75rem; overflow:hidden; border:1px solid var(--line); border-radius:.8rem; background:var(--surface); transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease; }
+.gallery .entry:first-child { border-top:1px solid var(--line); }
+.gallery .entry:hover { padding:.75rem; border-color:color-mix(in srgb,var(--accent) 45%,var(--line)); background:var(--surface); box-shadow:0 14px 30px rgba(54,59,92,.14); transform:translateY(-3px); }
+.gallery .glyph { grid-column:1/-1; grid-row:1; align-self:center; }
+.gallery .entry.image .glyph { width:100%; height:100%; border-radius:.55rem; }
+.gallery .entry-name { grid-column:1/-1; grid-row:2; width:100%; }
+.gallery .kind { grid-column:1; grid-row:3; }
+.gallery .detail { grid-column:2; grid-row:3; }
+.gallery .arrow { display:none; }
+.gallery .folder .glyph,.gallery .file:not(.image) .glyph { transform:scale(1.35); }
+.gallery .entry.image .glyph { cursor:zoom-in; }
+.image-lightbox { position:fixed; z-index:20; inset:0; display:grid; place-items:center; padding:clamp(1rem,4vw,3rem); background:rgba(10,12,20,.82); backdrop-filter:blur(10px); }
+.image-lightbox figure { display:grid; gap:.75rem; max-width:100%; max-height:100%; margin:0; padding:.75rem; overflow:auto; border:1px solid rgba(255,255,255,.2); border-radius:1rem; color:#fff; background:rgba(20,22,31,.96); box-shadow:0 30px 90px rgba(0,0,0,.45); }
+.image-lightbox img { display:block; max-width:min(90vw,1400px); max-height:calc(90vh - 4rem); max-height:calc(90dvh - 4rem); margin:auto; object-fit:contain; }
+.image-lightbox figcaption { overflow:hidden; padding:0 .25rem .15rem; font-size:.82rem; text-align:center; text-overflow:ellipsis; white-space:nowrap; opacity:.82; }
+.lightbox-close { position:fixed; z-index:1; top:max(1rem,env(safe-area-inset-top)); right:max(1rem,env(safe-area-inset-right)); display:grid; place-items:center; width:2.75rem; height:2.75rem; padding:0; border:1px solid rgba(255,255,255,.3); border-radius:50%; color:#fff; background:rgba(20,22,31,.78); font:300 1.8rem/1 sans-serif; cursor:pointer; }
+.lightbox-close:hover { background:rgba(91,91,214,.95); }
 .empty { display:grid; place-items:center; min-height:14rem; color:var(--muted); }
 .empty span { font:300 3rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .empty p { margin:.8rem 0 0; }
 :focus-visible { outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent); outline-offset:-3px; }
-@media (max-width:650px) { main { width:100%; padding:1rem; } header { padding:1.5rem 1.1rem; } .entry { grid-template-columns:1.8rem minmax(0,1fr) auto; padding-inline:1rem; } .kind,.arrow { display:none; } .detail { grid-column:3; } }
-@media (prefers-color-scheme:dark) { :root { --paper:#11131b; --surface:#191c27; --ink:#edf0f7; --muted:#a7adbd; --line:#303545; --accent:#a9a5ff; --accent-soft:#292943; --folder:#8e8af5; } body { background-image:radial-gradient(circle at 50% -20%,#252943 0,transparent 38rem); } .listing { box-shadow:0 25px 70px rgba(0,0,0,.25); } }
-@media (prefers-reduced-motion:reduce) { .entry,.arrow { transition:none; } }
+@media (max-width:650px) { main,.gallery-mode main { width:100%; padding:1rem; } header { padding:1.5rem 1.1rem; } .view-toggle { position:relative; right:auto; top:auto; width:max-content; margin-top:1rem; } .entry { grid-template-columns:2.4rem minmax(0,1fr) auto; padding-inline:1rem; } .kind,.arrow { display:none; } .detail { grid-column:3; } .entry.image .glyph { width:2.4rem; height:2.4rem; } .listing.gallery { grid-template-columns:repeat(auto-fill,minmax(145px,1fr)); gap:.65rem; padding:.65rem; } .gallery .entry { grid-template-columns:minmax(0,1fr); grid-template-rows:8.5rem auto auto; padding:.6rem; } .gallery .entry:hover { padding:.6rem; } .gallery .entry.image .glyph { width:100%; height:100%; } .gallery .detail { grid-column:1; grid-row:3; justify-self:start; } }
+@media (prefers-color-scheme:dark) { :root { --paper:#11131b; --surface:#191c27; --ink:#edf0f7; --muted:#a7adbd; --line:#303545; --accent:#a9a5ff; --accent-soft:#292943; --folder:#8e8af5; --grid:#262b38; } body { background-image:radial-gradient(circle at 50% -20%,#252943 0,transparent 38rem); } .listing { box-shadow:0 25px 70px rgba(0,0,0,.25); } }
+@media (prefers-reduced-motion:reduce) { .entry,.arrow,.entry.image .glyph img { transition:none; } .entry.image:hover .glyph img,.gallery .entry:hover { transform:none; } }
 "#;
 
 const MARKDOWN_CSS: &str = r#"
@@ -2433,6 +2665,136 @@ mod tests {
         assert!(page.contains("body.wrap .line::before { position:absolute;"));
         assert!(page.contains("</span><span class=\"line\">"));
         assert!(!page.contains("</span>\n<span class=\"line\">"));
+    }
+
+    #[test]
+    fn image_heavy_directory_offers_gallery_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        image::RgbImage::from_pixel(24, 16, image::Rgb([40, 90, 180]))
+            .save(root.join("photo.png"))
+            .unwrap();
+        fs::write(
+            root.join("icon.svg"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        )
+        .unwrap();
+        fs::write(root.join("notes.md"), "# hi\n").unwrap();
+        fs::create_dir(root.join("docs")).unwrap();
+
+        let page = render_directory_page(root, root).unwrap();
+
+        assert!(page.contains("<body>"));
+        assert!(page.contains("class=\"listing\""));
+        assert!(!page.contains("class=\"listing gallery\""));
+        assert!(page.contains("id=\"gallery-toggle\""));
+        assert!(page.contains("aria-pressed=\"false\""));
+        assert!(page.contains("HTTP / DIRECTORY"));
+        assert!(page.contains("class=\"entry file image\""));
+        assert!(page.contains("class=\"entry file image vector\""));
+        assert!(page.contains("src=\"/photo.png?mode=thumb\""));
+        assert!(page.contains("data-gallery-src=\"/photo.png?mode=gallery-thumb\""));
+        assert!(page.contains("data-preview-src=\"/photo.png?mode=asset\""));
+        assert!(page.contains("src=\"/icon.svg?mode=asset\""));
+        assert!(page.contains("class=\"entry file\" href=\"/notes.md\""));
+        assert!(!page.contains("notes.md?mode=thumb"));
+        assert!(page.contains("class=\"entry folder\" href=\"/docs/\""));
+        assert!(page.contains("loading=\"lazy\""));
+        assert!(
+            page.contains(".entry.image .glyph img { width:100%; height:100%; object-fit:cover;")
+        );
+        assert!(page.contains(".listing.gallery { display:grid;"));
+        assert!(page.contains("listing.classList.toggle('gallery')"));
+        assert!(page.contains("id=\"image-lightbox\""));
+        assert!(page.contains("if (event.target === lightbox) closeLightbox();"));
+        assert!(page.contains("if (event.key === 'Escape') closeLightbox();"));
+    }
+
+    #[test]
+    fn gallery_is_available_when_directory_contains_any_image() {
+        assert!(should_use_gallery(3, 5));
+        assert!(should_use_gallery(4, 5));
+        assert!(should_use_gallery(1, 5));
+        assert!(!should_use_gallery(0, 5));
+        assert!(!should_use_gallery(0, 0));
+    }
+
+    #[test]
+    fn regular_directory_keeps_the_compact_listing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        image::RgbImage::from_pixel(24, 16, image::Rgb([40, 90, 180]))
+            .save(root.join("photo.png"))
+            .unwrap();
+        fs::write(root.join("one.txt"), "one").unwrap();
+        fs::write(root.join("two.txt"), "two").unwrap();
+
+        let page = render_directory_page(root, root).unwrap();
+
+        assert!(page.contains("<body>"));
+        assert!(page.contains("class=\"listing\""));
+        assert!(!page.contains("class=\"listing gallery\""));
+        assert!(page.contains("id=\"gallery-toggle\""));
+        assert!(page.contains("data-gallery-src="));
+        assert!(page.contains("src=\"/photo.png?mode=thumb\""));
+    }
+
+    #[test]
+    fn generates_a_downscaled_thumbnail_for_raster_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide.png");
+        image::RgbImage::from_pixel(800, 200, image::Rgb([30, 80, 180]))
+            .save(&path)
+            .unwrap();
+
+        let (bytes, content_type) = render_image_thumbnail(&path, THUMBNAIL_MAX_EDGE).unwrap();
+        assert_eq!(content_type, "image/jpeg");
+        let thumb = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(thumb.width(), 128);
+        assert_eq!(thumb.height(), 32);
+
+        let (bytes, _) = render_image_thumbnail(&path, GALLERY_THUMBNAIL_MAX_EDGE).unwrap();
+        let gallery_thumb = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(gallery_thumb.width(), 512);
+        assert_eq!(gallery_thumb.height(), 128);
+
+        let transparent = directory.path().join("alpha.png");
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([12, 24, 48, 80]))
+            .save(&transparent)
+            .unwrap();
+        let (bytes, content_type) =
+            render_image_thumbnail(&transparent, THUMBNAIL_MAX_EDGE).unwrap();
+        assert_eq!(content_type, "image/png");
+        assert!(image::load_from_memory(&bytes).unwrap().color().has_alpha());
+    }
+
+    #[test]
+    fn thumbnail_url_skips_non_images_and_huge_files() {
+        assert_eq!(
+            thumbnail_url("/photo.png", Path::new("photo.png"), 1024, false).as_deref(),
+            Some("/photo.png?mode=thumb")
+        );
+        assert_eq!(
+            thumbnail_url("/photo.png", Path::new("photo.png"), 1024, true).as_deref(),
+            Some("/photo.png?mode=gallery-thumb")
+        );
+        assert_eq!(
+            thumbnail_url("/logo.svg", Path::new("logo.svg"), 2048, true).as_deref(),
+            Some("/logo.svg?mode=asset")
+        );
+        assert_eq!(
+            thumbnail_url("/notes.md", Path::new("notes.md"), 128, false),
+            None
+        );
+        assert_eq!(
+            thumbnail_url(
+                "/photo.png",
+                Path::new("photo.png"),
+                MAX_THUMBNAIL_SOURCE + 1,
+                true
+            ),
+            None
+        );
     }
 
     #[test]

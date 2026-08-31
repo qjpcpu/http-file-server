@@ -5,6 +5,7 @@ edition = "2021"
 description = "A tiny static file server"
 
 [dependencies]
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
