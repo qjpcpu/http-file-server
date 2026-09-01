@@ -229,6 +229,7 @@ fn handle_connection(
     let thumb_mode = mode.as_deref() == Some("thumb");
     let gallery_thumb_mode = mode.as_deref() == Some("gallery-thumb");
     let collaboration_mode = mode.as_deref() == Some("collab");
+    let gallery_view = query_parameter(query, "view").as_deref() == Some("gallery");
     let decoded = match percent_decode(request_path) {
         Some(path) => path,
         None => return send_text(&mut stream, 400, "Bad Request", "无效的 URL\n", head_only),
@@ -413,7 +414,21 @@ fn handle_connection(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("SVG image");
-        let body = render_svg_page(title, metadata.len());
+        let body = render_svg_page(title, metadata.len(), gallery_view);
+        return send_html(&mut stream, &body, head_only);
+    }
+
+    if is_raster_image(&canonical) && request_wants_html(&headers) {
+        let title = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Image");
+        let kind = canonical
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("IMAGE")
+            .to_ascii_uppercase();
+        let body = render_image_page(title, &kind, metadata.len(), gallery_view);
         return send_html(&mut stream, &body, head_only);
     }
 
@@ -747,7 +762,9 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
             (None, _) => "<span class=\"glyph\" aria-hidden=\"true\"></span>".to_string(),
         };
         let preview = if is_image {
-            format!(" data-preview-src=\"{href}?mode=asset\"")
+            format!(
+                " data-preview-src=\"{href}?mode=asset\" data-list-href=\"{href}\" data-gallery-href=\"{href}?view=gallery\""
+            )
         } else {
             String::new()
         };
@@ -1278,10 +1295,29 @@ fn render_text_page(content: &str, title: &str, kind: &str, path: &Path) -> Stri
     )
 }
 
-fn render_svg_page(title: &str, size: u64) -> String {
+fn image_back_href(gallery_view: bool) -> &'static str {
+    if gallery_view {
+        "./?view=gallery"
+    } else {
+        "./"
+    }
+}
+
+fn render_svg_page(title: &str, size: u64, gallery_view: bool) -> String {
     let title = escape_html(title);
+    let back_href = image_back_href(gallery_view);
     format!(
-        "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\"><title>{title}</title><style>{SVG_CSS}</style></head><body><header><a class=\"back\" href=\"./\" aria-label=\"返回目录\">←</a><span class=\"kind\">SVG</span><span class=\"filename\">{title}</span><span class=\"meta\">{size}</span><button id=\"scale\" type=\"button\">原始尺寸</button><a class=\"raw\" href=\"?mode=raw\">Raw</a></header><main class=\"canvas\"><img id=\"artwork\" src=\"?mode=asset\" alt=\"{title}\"><p id=\"error\" hidden>无法渲染这个 SVG 文件</p></main><script>{SVG_JS}</script></body></html>",
+        "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\"><title>{title}</title><style>{SVG_CSS}</style></head><body><header><a class=\"back\" href=\"{back_href}\" aria-label=\"返回目录\">←</a><span class=\"kind\">SVG</span><span class=\"filename\">{title}</span><span class=\"meta\">{size}</span><button id=\"scale\" type=\"button\">原始尺寸</button><a class=\"raw\" href=\"?mode=raw\">Raw</a></header><main class=\"canvas\"><img id=\"artwork\" src=\"?mode=asset\" alt=\"{title}\"><p id=\"error\" hidden>无法渲染这个 SVG 文件</p></main><script>{SVG_JS}</script></body></html>",
+        size = human_size(size)
+    )
+}
+
+fn render_image_page(title: &str, kind: &str, size: u64, gallery_view: bool) -> String {
+    let title = escape_html(title);
+    let kind = escape_html(kind);
+    let back_href = image_back_href(gallery_view);
+    format!(
+        "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\"><title>{title}</title><style>{SVG_CSS}</style></head><body><header><a class=\"back\" href=\"{back_href}\" aria-label=\"返回目录\">←</a><span class=\"kind\">{kind}</span><span class=\"filename\">{title}</span><span class=\"meta\">{size}</span><button id=\"scale\" type=\"button\">原始尺寸</button><a class=\"raw\" href=\"?mode=asset\">原图</a></header><main class=\"canvas\"><img id=\"artwork\" src=\"?mode=asset\" alt=\"{title}\"><p id=\"error\" hidden>无法渲染这张图片</p></main><script>{SVG_JS}</script></body></html>",
         size = human_size(size)
     )
 }
@@ -1616,6 +1652,28 @@ if (galleryToggle) {
   const lightboxClose = lightbox.querySelector('.lightbox-close');
   let previewTrigger = null;
 
+  const setGallery = (enabled, updateUrl = true) => {
+    listing.classList.toggle('gallery', enabled);
+    document.body.classList.toggle('gallery-mode', enabled);
+    galleryToggle.setAttribute('aria-pressed', String(enabled));
+    galleryToggle.innerHTML = enabled
+      ? '<span aria-hidden="true">☷</span> 列表'
+      : '<span aria-hidden="true">▦</span> Gallery';
+    thumbnails.forEach(image => {
+      const source = enabled ? image.dataset.gallerySrc : image.dataset.listSrc;
+      if (source && image.getAttribute('src') !== source) image.setAttribute('src', source);
+    });
+    listing.querySelectorAll('.entry.image[data-gallery-href]').forEach(entry => {
+      entry.setAttribute('href', enabled ? entry.dataset.galleryHref : entry.dataset.listHref);
+    });
+    if (updateUrl) {
+      const url = new URL(location.href);
+      if (enabled) url.searchParams.set('view', 'gallery');
+      else url.searchParams.delete('view');
+      history.replaceState(null, '', url);
+    }
+  };
+
   const closeLightbox = () => {
     if (lightbox.hidden) return;
     lightbox.hidden = true;
@@ -1650,18 +1708,12 @@ if (galleryToggle) {
   });
 
   galleryToggle.addEventListener('click', () => {
-    const enabled = listing.classList.toggle('gallery');
+    const enabled = !listing.classList.contains('gallery');
     if (!enabled) closeLightbox();
-    document.body.classList.toggle('gallery-mode', enabled);
-    galleryToggle.setAttribute('aria-pressed', String(enabled));
-    galleryToggle.innerHTML = enabled
-      ? '<span aria-hidden="true">☷</span> 列表'
-      : '<span aria-hidden="true">▦</span> Gallery';
-    thumbnails.forEach(image => {
-      const source = enabled ? image.dataset.gallerySrc : image.dataset.listSrc;
-      if (source && image.getAttribute('src') !== source) image.setAttribute('src', source);
-    });
+    setGallery(enabled);
   });
+
+  setGallery(new URLSearchParams(location.search).get('view') === 'gallery', false);
 }
 "#;
 
@@ -2704,7 +2756,12 @@ mod tests {
             page.contains(".entry.image .glyph img { width:100%; height:100%; object-fit:cover;")
         );
         assert!(page.contains(".listing.gallery { display:grid;"));
-        assert!(page.contains("listing.classList.toggle('gallery')"));
+        assert!(page.contains("listing.classList.toggle('gallery', enabled)"));
+        assert!(page.contains("data-gallery-href=\"/photo.png?view=gallery\""));
+        assert!(page.contains("url.searchParams.set('view', 'gallery')"));
+        assert!(page.contains(
+            "setGallery(new URLSearchParams(location.search).get('view') === 'gallery', false)"
+        ));
         assert!(page.contains("id=\"image-lightbox\""));
         assert!(page.contains("if (event.target === lightbox) closeLightbox();"));
         assert!(page.contains("if (event.key === 'Escape') closeLightbox();"));
@@ -2799,14 +2856,27 @@ mod tests {
 
     #[test]
     fn renders_svg_in_an_isolated_image_preview() {
-        let page = render_svg_page("icon<&>.svg", 1536);
+        let page = render_svg_page("icon<&>.svg", 1536, false);
 
         assert!(page.starts_with("<!doctype html>"));
         assert!(page.contains("src=\"?mode=asset\""));
         assert!(page.contains("href=\"?mode=raw\""));
+        assert!(page.contains("class=\"back\" href=\"./\""));
         assert!(page.contains("class=\"canvas\""));
         assert!(page.contains("icon&lt;&amp;&gt;.svg"));
         assert!(!page.contains("icon<&>.svg"));
+    }
+
+    #[test]
+    fn renders_raster_images_with_a_gallery_aware_back_link() {
+        let page = render_image_page("photo<&>.png", "PNG", 2048, true);
+
+        assert!(page.starts_with("<!doctype html>"));
+        assert!(page.contains("class=\"back\" href=\"./?view=gallery\""));
+        assert!(page.contains("src=\"?mode=asset\""));
+        assert!(page.contains(">PNG</span>"));
+        assert!(page.contains("photo&lt;&amp;&gt;.png"));
+        assert!(!page.contains("photo<&>.png"));
     }
 
     #[test]
