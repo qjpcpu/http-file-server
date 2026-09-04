@@ -98,6 +98,9 @@ cargo run --release -- -p 3000
 
 # 启动成功后将进程 PID 写入文件；未传 -pid 时不会创建 PID 文件
 cargo run --release -- -p 3000 -pid /tmp/http-file-server.pid
+
+# 作为普通静态网站服务器使用；目录返回 index.html，文件不做预览或转换
+cargo run --release -- --web -p 3000
 ```
 
 编译后也可以直接运行：
@@ -106,3 +109,6 @@ cargo run --release -- -p 3000 -pid /tmp/http-file-server.pid
 cargo build --release
 ./target/release/http -p 3000 -pid /tmp/http-file-server.pid
 ```
+
+`--web` 模式只接受 GET 和 HEAD 请求。它不会生成目录页、预览页、编辑接口、站点图标或
+美化错误页；目录中没有 `index.html` 时返回 403。

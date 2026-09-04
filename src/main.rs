@@ -36,6 +36,7 @@ struct PortConfig {
     port: u16,
     fallback_to_random: bool,
     pid_file: Option<PathBuf>,
+    web: bool,
 }
 
 #[derive(Default)]
@@ -94,7 +95,9 @@ fn main() {
                 let collaboration = collaboration.clone();
                 let reviews = reviews.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, &root, &collaboration, &reviews) {
+                    if let Err(error) =
+                        handle_connection(stream, &root, &collaboration, &reviews, port_config.web)
+                    {
                         eprintln!("请求处理失败: {error}");
                     }
                 });
@@ -111,6 +114,7 @@ where
     let mut port = DEFAULT_PORT;
     let mut fallback_to_random = true;
     let mut pid_file = None;
+    let mut web = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--port" => {
@@ -132,6 +136,7 @@ where
                 }
                 pid_file = Some(PathBuf::from(value));
             }
+            "--web" => web = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 return Ok(None);
@@ -143,6 +148,7 @@ where
         port,
         fallback_to_random,
         pid_file,
+        web,
     }))
 }
 
@@ -156,7 +162,7 @@ fn bind_listener(config: &PortConfig) -> io::Result<TcpListener> {
 }
 
 fn usage() -> &'static str {
-    "用法: http [-p PORT] [-pid FILE]\n\n选项:\n  -p, --port PORT  指定监听端口（默认 8080）\n  -pid, --pid FILE 将启动进程 PID 写入指定文件\n  -h, --help       显示帮助"
+    "用法: http [-p PORT] [-pid FILE] [--web]\n\n选项:\n  -p, --port PORT  指定监听端口（默认 8080）\n  -pid, --pid FILE 将启动进程 PID 写入指定文件\n  --web            以原始静态网站服务器模式运行\n  -h, --help       显示帮助"
 }
 
 fn write_pid_file(path: &Path) -> io::Result<()> {
@@ -168,6 +174,7 @@ fn handle_connection(
     root: &Path,
     collaboration: &CollaborationHub,
     reviews: &ReviewHub,
+    web: bool,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -178,12 +185,18 @@ fn handle_connection(
     let target = parts.next().unwrap_or("");
     let head_only = method == "HEAD";
 
-    if !matches!(method, "GET" | "HEAD" | "POST" | "PUT") {
+    if (web && !matches!(method, "GET" | "HEAD"))
+        || (!web && !matches!(method, "GET" | "HEAD" | "POST" | "PUT"))
+    {
         return send_text(
             &mut stream,
             405,
             "Method Not Allowed",
-            "仅支持 GET、HEAD、POST 和 PUT\n",
+            if web {
+                "仅支持 GET 和 HEAD\n"
+            } else {
+                "仅支持 GET、HEAD、POST 和 PUT\n"
+            },
             head_only,
         );
     }
@@ -204,6 +217,9 @@ fn handle_connection(
 
     let (request_path, query) = target.split_once('?').unwrap_or((target, ""));
     let request_path = request_path.split('#').next().unwrap_or("/");
+    if web {
+        return handle_web_request(&mut stream, root, request_path, query, head_only);
+    }
     if matches!(method, "GET" | "HEAD") && request_path == DRAWIO_VIEWER_PATH {
         return send_content(
             &mut stream,
@@ -569,6 +585,72 @@ fn handle_connection(
 
     send_file(
         &mut stream,
+        &canonical,
+        metadata.len(),
+        mime_type(&canonical),
+        head_only,
+    )
+}
+
+fn handle_web_request(
+    stream: &mut TcpStream,
+    root: &Path,
+    request_path: &str,
+    query: &str,
+    head_only: bool,
+) -> io::Result<()> {
+    let decoded = match percent_decode(request_path) {
+        Some(path) => path,
+        None => return send_text(stream, 400, "Bad Request", "无效的 URL\n", head_only),
+    };
+    let relative = match safe_relative_path(&decoded) {
+        Some(path) => path,
+        None => return send_text(stream, 403, "Forbidden", "禁止访问\n", head_only),
+    };
+    let canonical = match fs::canonicalize(root.join(relative)) {
+        Ok(path) if path.starts_with(root) => path,
+        Ok(_) => return send_text(stream, 403, "Forbidden", "禁止访问\n", head_only),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return send_text(stream, 404, "Not Found", "Not Found\n", head_only)
+        }
+        Err(error) => return Err(error),
+    };
+
+    let metadata = fs::metadata(&canonical)?;
+    if metadata.is_dir() {
+        if !request_path.ends_with('/') {
+            let location = if query.is_empty() {
+                format!("{request_path}/")
+            } else {
+                format!("{request_path}/?{query}")
+            };
+            return send_redirect(stream, &location);
+        }
+        let index = match fs::canonicalize(canonical.join("index.html")) {
+            Ok(path) if path.starts_with(root) => path,
+            Ok(_) => return send_text(stream, 403, "Forbidden", "Forbidden\n", head_only),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return send_text(stream, 403, "Forbidden", "Forbidden\n", head_only)
+            }
+            Err(error) => return Err(error),
+        };
+        let index_metadata = fs::metadata(&index)?;
+        if !index_metadata.is_file() {
+            return send_text(stream, 403, "Forbidden", "Forbidden\n", head_only);
+        }
+        return send_file(
+            stream,
+            &index,
+            index_metadata.len(),
+            mime_type(&index),
+            head_only,
+        );
+    }
+    if !metadata.is_file() {
+        return send_text(stream, 404, "Not Found", "Not Found\n", head_only);
+    }
+    send_file(
+        stream,
         &canonical,
         metadata.len(),
         mime_type(&canonical),
@@ -3138,6 +3220,7 @@ mod tests {
                 port: 8080,
                 fallback_to_random: true,
                 pid_file: None,
+                web: false,
             })
         );
         assert_eq!(
@@ -3146,6 +3229,7 @@ mod tests {
                 port: 3000,
                 fallback_to_random: false,
                 pid_file: None,
+                web: false,
             })
         );
         assert_eq!(
@@ -3163,6 +3247,16 @@ mod tests {
                 port: 9000,
                 fallback_to_random: false,
                 pid_file: Some(PathBuf::from("/tmp/http.pid")),
+                web: false,
+            })
+        );
+        assert_eq!(
+            parse_args(vec!["--web".into()].into_iter()).unwrap(),
+            Some(PortConfig {
+                port: 8080,
+                fallback_to_random: true,
+                pid_file: None,
+                web: true,
             })
         );
         assert!(parse_args(vec!["-pid".into()].into_iter()).is_err());
@@ -3176,6 +3270,7 @@ mod tests {
             port: occupied_port,
             fallback_to_random: true,
             pid_file: None,
+            web: false,
         })
         .unwrap();
 
@@ -3190,6 +3285,7 @@ mod tests {
             port: occupied_port,
             fallback_to_random: false,
             pid_file: None,
+            web: false,
         })
         .unwrap_err();
 
@@ -3207,6 +3303,52 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             format!("{}\n", std::process::id())
         );
+    }
+
+    #[test]
+    fn web_mode_serves_index_and_files_without_special_rendering() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("index.html"), "<h1>home</h1>").unwrap();
+        fs::write(directory.path().join("notes.md"), "# Notes\n").unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let collaboration = CollaborationHub::default();
+            let reviews = ReviewHub::default();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection(stream, &root, &collaboration, &reviews, true).unwrap();
+            }
+        });
+
+        let request = |target: &str| {
+            let mut client = TcpStream::connect(address).unwrap();
+            write!(
+                client,
+                "GET {target} HTTP/1.1\r\nHost: {address}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        let index = request("/");
+        assert!(index.starts_with("HTTP/1.1 200 OK"));
+        assert!(index.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(index.ends_with("<h1>home</h1>"));
+
+        let markdown = request("/notes.md?mode=preview");
+        assert!(markdown.starts_with("HTTP/1.1 200 OK"));
+        assert!(markdown.contains("Content-Type: text/markdown; charset=utf-8"));
+        assert!(markdown.ends_with("# Notes\n"));
+        assert!(!markdown.contains("<!doctype html>"));
+
+        let favicon = request("/favicon.svg");
+        assert!(favicon.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(favicon.ends_with("Not Found\n"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -3394,7 +3536,7 @@ mod tests {
         let reviews = ReviewHub::default();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle_connection(stream, &root, &hub, &reviews).unwrap();
+            handle_connection(stream, &root, &hub, &reviews, false).unwrap();
         });
 
         let (mut socket, response) =
@@ -3584,7 +3726,7 @@ mod tests {
                 let collaboration = collaboration.clone();
                 let reviews = reviews.clone();
                 connections.push(std::thread::spawn(move || {
-                    handle_connection(stream, &root, &collaboration, &reviews).unwrap();
+                    handle_connection(stream, &root, &collaboration, &reviews, false).unwrap();
                 }));
             }
             for connection in connections {
