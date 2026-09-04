@@ -21,6 +21,24 @@ Markdown 阅读页同时提供多人实时审阅。首次发表评论时输入�
 和在线审阅者会实时同步，已提交的内容立即保存，刷新页面不会丢失。评论按 `open`（待处理）、
 `addressed`（AI 已处理、待确认）和 `resolved`（已解决）流转。
 
+### 审阅流程预览
+
+1. 审阅者划选正文并添加评论，评论会锚定到对应文本：
+
+   ![划选 Markdown 正文并添加待处理评论](docs/images/review-open.png)
+
+2. Codex 修改正文、回复处理结果，评论进入待确认状态：
+
+   ```text
+   codex> 处理掉 your-plan.md.review.json 的评论
+   ```
+
+   ![Codex 修改正文并回复评论](docs/images/review-addressed.png)
+
+3. 审阅者确认修改后解决评论，文档即可进入执行阶段：
+
+   ![审阅者确认并解决评论](docs/images/review-resolved.png)
+
 审阅数据保存在 Markdown 旁边的 `<文件名>.review.json`，例如 `spec.md.review.json`。这些
 旁车文件不会出现在目录页，但 AI 可以直接读写。AI 处理一条评论时，应修改 Markdown，
 在对应评论的 `messages` 中追加处理说明，并将 `status` 改为 `addressed`：
