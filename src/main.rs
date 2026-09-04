@@ -14,8 +14,10 @@ use syntect::util::LinesWithEndings;
 use tungstenite::handshake::derive_accept_key;
 
 mod collaboration;
+mod review;
 
 use collaboration::CollaborationHub;
+use review::{read_review, ReviewAction, ReviewHub};
 
 const DEFAULT_PORT: u16 = 8080;
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
@@ -84,13 +86,15 @@ fn main() {
 
     println!("Serving {} at http://localhost:{port}", root.display());
     let collaboration = CollaborationHub::default();
+    let reviews = ReviewHub::default();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let root = root.clone();
                 let collaboration = collaboration.clone();
+                let reviews = reviews.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, &root, &collaboration) {
+                    if let Err(error) = handle_connection(stream, &root, &collaboration, &reviews) {
                         eprintln!("请求处理失败: {error}");
                     }
                 });
@@ -163,6 +167,7 @@ fn handle_connection(
     mut stream: TcpStream,
     root: &Path,
     collaboration: &CollaborationHub,
+    reviews: &ReviewHub,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -229,6 +234,9 @@ fn handle_connection(
     let thumb_mode = mode.as_deref() == Some("thumb");
     let gallery_thumb_mode = mode.as_deref() == Some("gallery-thumb");
     let collaboration_mode = mode.as_deref() == Some("collab");
+    let review_data_mode = mode.as_deref() == Some("review-data");
+    let review_action_mode = mode.as_deref() == Some("review-action");
+    let review_collaboration_mode = mode.as_deref() == Some("review-collab");
     let gallery_view = query_parameter(query, "view").as_deref() == Some("gallery");
     let decoded = match percent_decode(request_path) {
         Some(path) => path,
@@ -265,6 +273,58 @@ fn handle_connection(
     if !metadata.is_file() {
         let body = render_not_found_page(&decoded);
         return send_html_status(&mut stream, 404, "Not Found", &body, head_only);
+    }
+
+    if review_collaboration_mode {
+        if method != "GET" || !has_extension(&canonical, "md") {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "仅支持协同审阅 Markdown 文件\n",
+                head_only,
+            );
+        }
+        if !is_websocket_upgrade(&headers) {
+            return send_text(
+                &mut stream,
+                426,
+                "Upgrade Required",
+                "该接口需要 WebSocket 连接\n",
+                false,
+            );
+        }
+        let connection = reviews.connect(&canonical);
+        let partially_read = reader.buffer().to_vec();
+        let accept = derive_accept_key(headers.websocket_key.as_bytes());
+        write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )?;
+        drop(reader);
+        return connection.run(stream, partially_read, MAX_REQUEST_BODY);
+    }
+
+    if review_data_mode {
+        if !matches!(method, "GET" | "HEAD") || !has_extension(&canonical, "md") {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "仅支持读取 Markdown 审阅数据\n",
+                head_only,
+            );
+        }
+        return match read_review(&canonical) {
+            Ok(review) => send_json(&mut stream, &review, head_only),
+            Err(error) => send_text(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                &format!("{error}\n"),
+                head_only,
+            ),
+        };
     }
 
     if collaboration_mode {
@@ -325,6 +385,28 @@ fn handle_connection(
     }
 
     if method == "POST" {
+        if review_action_mode && has_extension(&canonical, "md") {
+            let body = match read_request_body(&mut reader, headers.content_length) {
+                Ok(body) => body,
+                Err(error) => return send_text(&mut stream, 400, "Bad Request", &error, false),
+            };
+            let action = match serde_json::from_str::<ReviewAction>(&body) {
+                Ok(action) => action,
+                Err(error) => {
+                    return send_text(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        &format!("无效的审阅操作：{error}\n"),
+                        false,
+                    )
+                }
+            };
+            return match reviews.apply_action(&canonical, action) {
+                Ok(review) => send_json(&mut stream, &review, false),
+                Err(error) => send_text(&mut stream, 409, "Conflict", &format!("{error}\n"), false),
+            };
+        }
         if !preview_mode || !has_extension(&canonical, "md") {
             return send_text(
                 &mut stream,
@@ -630,6 +712,16 @@ fn send_content(
     Ok(())
 }
 
+fn send_json<T: serde::Serialize>(
+    stream: &mut TcpStream,
+    value: &T,
+    head_only: bool,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    send_content(stream, &body, "application/json; charset=utf-8", head_only)
+}
+
 fn send_redirect(stream: &mut TcpStream, location: &str) -> io::Result<()> {
     write!(
         stream,
@@ -685,6 +777,9 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
+        if review::is_review_sidecar(&entry.path()) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         let metadata = entry.metadata().ok();
         entries.push(DirectoryEntry {
@@ -1367,7 +1462,7 @@ fn render_markdown_page(markdown: &str, title: &str) -> String {
     let title = escape_html(title);
     let source = escape_html(markdown);
     format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title}</title>\n<style>{MARKDOWN_CSS}</style>\n</head>\n<body>\n<header class=\"topbar\"><a class=\"home\" href=\"./\" aria-label=\"返回目录\">←</a><span class=\"mark\">MD</span><span class=\"filename\">{title}</span><span class=\"top-actions\"><a class=\"button ghost\" href=\"?mode=raw\">Raw</a><button class=\"button\" id=\"edit-button\" type=\"button\">编辑</button></span></header>\n<div id=\"reader\" class=\"reader-layout\"><aside id=\"toc\" aria-label=\"文档目录\"></aside><main class=\"paper\"><article id=\"article\">{article}</article></main></div>\n<section id=\"editor\" class=\"editor-shell\" hidden><div class=\"editor-toolbar\"><div class=\"format-tools\" role=\"toolbar\" aria-label=\"Markdown 格式\"><button type=\"button\" data-format=\"heading\" title=\"标题\">H</button><button type=\"button\" data-format=\"bold\" title=\"粗体\"><strong>B</strong></button><button type=\"button\" data-format=\"italic\" title=\"斜体\"><em>I</em></button><button type=\"button\" data-format=\"link\" title=\"链接\">↗</button><button type=\"button\" data-format=\"quote\" title=\"引用\">❯</button><button type=\"button\" data-format=\"code\" title=\"代码\">&lt;/&gt;</button><button type=\"button\" data-format=\"list\" title=\"列表\">≡</button><button type=\"button\" data-format=\"task\" title=\"任务\">☑</button></div><span class=\"collaboration-status\" role=\"status\"><i id=\"connection-dot\" aria-hidden=\"true\"></i><span id=\"save-status\">未连接</span><span id=\"presence\"></span></span><button class=\"button ghost\" id=\"cancel-button\" type=\"button\">退出编辑</button><button class=\"button\" id=\"save-button\" type=\"button\">立即保存</button></div><div class=\"editor-panes\"><div class=\"pane preview-pane\"><span>PREVIEW</span><iframe id=\"preview\" title=\"Markdown 实时预览\"></iframe></div><label class=\"pane source-pane\"><span>MARKDOWN</span><textarea id=\"source\" spellcheck=\"false\" disabled>{source}</textarea></label></div></section>\n<script src=\"{YJS_PATH}\"></script><script>{MARKDOWN_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title}</title>\n<style>{MARKDOWN_CSS}</style>\n</head>\n<body class=\"review-closed\">\n<header class=\"topbar\"><a class=\"home\" href=\"./\" aria-label=\"返回目录\">←</a><span class=\"mark\">MD</span><span class=\"filename\">{title}</span><span class=\"top-actions\"><button class=\"identity-button\" id=\"identity-button\" type=\"button\" title=\"切换审阅身份\"></button><button class=\"button ghost review-toggle\" id=\"review-toggle\" type=\"button\" aria-expanded=\"false\">评论 <b id=\"review-count\">0</b></button><a class=\"button ghost raw-button\" href=\"?mode=raw\">Raw</a><button class=\"button\" id=\"edit-button\" type=\"button\">编辑</button></span></header>\n<div id=\"reader\" class=\"reader-layout\"><aside id=\"toc\" aria-label=\"文档目录\"></aside><main class=\"paper\"><article id=\"article\">{article}</article></main><aside id=\"review-panel\" class=\"review-panel\" aria-label=\"审阅评论\"><header class=\"review-header\"><div><span>REVIEW</span><strong>审阅讨论</strong></div><button id=\"review-close\" type=\"button\" aria-label=\"收起评论\">×</button></header><div class=\"review-presence\"><i aria-hidden=\"true\"></i><span id=\"review-users\">正在连接…</span></div><button class=\"document-comment\" id=\"document-comment\" type=\"button\">＋ 全文评论</button><div class=\"review-composer\" id=\"review-composer\" hidden><p id=\"composer-scope\"></p><label for=\"comment-body\">写下需要讨论或修改的内容</label><textarea id=\"comment-body\" rows=\"4\"></textarea><div><button class=\"text-button\" id=\"composer-cancel\" type=\"button\">取消</button><button class=\"button\" id=\"composer-submit\" type=\"button\">提交评论</button></div></div><nav class=\"review-filters\" aria-label=\"评论状态\"><button class=\"active\" type=\"button\" data-review-filter=\"open\">待处理 <b>0</b></button><button type=\"button\" data-review-filter=\"addressed\">待确认 <b>0</b></button><button type=\"button\" data-review-filter=\"resolved\">已解决 <b>0</b></button></nav><div class=\"review-complete\" id=\"review-complete\" hidden><strong>审阅已完成</strong><span>可以交给 AI 执行</span></div><div class=\"review-error\" id=\"review-error\" role=\"status\" hidden></div><div class=\"comment-list\" id=\"comment-list\"></div></aside></div>\n<button class=\"selection-comment\" id=\"selection-comment\" type=\"button\" hidden>＋ 添加批注</button><div class=\"toast\" id=\"review-toast\" role=\"status\" hidden></div><dialog class=\"identity-dialog\" id=\"identity-dialog\"><form method=\"dialog\"><span class=\"dialog-kicker\">REVIEW IDENTITY</span><h2>你以什么身份参与审阅？</h2><p>输入一个方便其他审阅者辨认的名称，浏览器会在此设备上记住它。</p><label for=\"identity-input\">审阅人名称</label><input id=\"identity-input\" name=\"identity\" autocomplete=\"username\" placeholder=\"例如：小明、Alice、dev-01\" required><span class=\"identity-error\" id=\"identity-error\"></span><button class=\"button\" id=\"identity-submit\" value=\"confirm\">进入审阅</button></form></dialog>\n<section id=\"editor\" class=\"editor-shell\" hidden><div class=\"editor-toolbar\"><div class=\"format-tools\" role=\"toolbar\" aria-label=\"Markdown 格式\"><button type=\"button\" data-format=\"heading\" title=\"标题\">H</button><button type=\"button\" data-format=\"bold\" title=\"粗体\"><strong>B</strong></button><button type=\"button\" data-format=\"italic\" title=\"斜体\"><em>I</em></button><button type=\"button\" data-format=\"link\" title=\"链接\">↗</button><button type=\"button\" data-format=\"quote\" title=\"引用\">❯</button><button type=\"button\" data-format=\"code\" title=\"代码\">&lt;/&gt;</button><button type=\"button\" data-format=\"list\" title=\"列表\">≡</button><button type=\"button\" data-format=\"task\" title=\"任务\">☑</button></div><span class=\"collaboration-status\" role=\"status\"><i id=\"connection-dot\" aria-hidden=\"true\"></i><span id=\"save-status\">未连接</span><span id=\"presence\"></span></span><button class=\"button ghost\" id=\"cancel-button\" type=\"button\">退出编辑</button><button class=\"button\" id=\"save-button\" type=\"button\">立即保存</button></div><div class=\"editor-panes\"><div class=\"pane preview-pane\"><span>PREVIEW</span><iframe id=\"preview\" title=\"Markdown 实时预览\"></iframe></div><label class=\"pane source-pane\"><span>MARKDOWN</span><textarea id=\"source\" spellcheck=\"false\" disabled>{source}</textarea></label></div></section>\n<script src=\"{YJS_PATH}\"></script><script>{MARKDOWN_JS}</script>\n</body>\n</html>"
     )
 }
 
@@ -1408,23 +1503,39 @@ fn render_markdown_article(markdown: &str) -> String {
                 Event::Html(value) | Event::InlineHtml(value) => Event::Text(value),
                 event => event,
             };
-            let mut events = Vec::with_capacity(if is_anchor { 2 } else { 1 });
+            let event_start_utf16 = if range.start >= source_byte {
+                let offset = source_utf16
+                    + markdown[source_byte..range.start].encode_utf16().count();
+                source_byte = range.start;
+                source_utf16 = offset;
+                offset
+            } else {
+                markdown[..range.start].encode_utf16().count()
+            };
+            let event_end_utf16 = event_start_utf16
+                + markdown[range.start..range.end].encode_utf16().count();
+            let is_source_run = matches!(&event, Event::Text(_) | Event::Code(_));
+            let mut events = Vec::with_capacity(4);
             if is_anchor {
-                // JavaScript string offsets use UTF-16 code units rather than UTF-8 bytes.
-                // Block starts are encountered in source order, so this stays linear even
-                // for large collaborative documents.
-                if range.start >= source_byte {
-                    source_utf16 += markdown[source_byte..range.start].encode_utf16().count();
-                    source_byte = range.start;
-                }
                 events.push(Event::Html(CowStr::Boxed(
                     format!(
-                        "<span class=\"sync-anchor\" data-source-offset=\"{source_utf16}\" aria-hidden=\"true\"></span>"
+                        "<span class=\"sync-anchor\" data-source-offset=\"{event_start_utf16}\" aria-hidden=\"true\"></span>"
+                    )
+                    .into_boxed_str(),
+                )));
+            }
+            if is_source_run {
+                events.push(Event::Html(CowStr::Boxed(
+                    format!(
+                        "<span class=\"source-run\" data-source-start=\"{event_start_utf16}\" data-source-end=\"{event_end_utf16}\">"
                     )
                     .into_boxed_str(),
                 )));
             }
             events.push(event);
+            if is_source_run {
+                events.push(Event::Html(CowStr::Borrowed("</span>")));
+            }
             events
         });
     let mut article = String::new();
@@ -1783,7 +1894,7 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 "#;
 
 const MARKDOWN_CSS: &str = r#"
-:root { color-scheme:light dark; --paper:#f7f8fc; --surface:#fff; --ink:#202333; --muted:#6d7287; --line:#dfe3ee; --accent:#5b5bd6; --accent-soft:#eeeeff; --code:#171925; --code-ink:#e8eaf2; --quote:#eef4ff; }
+:root { color-scheme:light dark; --paper:#f7f8fc; --surface:#fff; --ink:#202333; --muted:#6d7287; --line:#dfe3ee; --accent:#5b5bd6; --accent-soft:#eeeeff; --code:#171925; --code-ink:#e8eaf2; --quote:#eef4ff; --comment:#fff1b8; --comment-line:#c89926; --addressed:#9b6b22; --success:#2f7d55; }
 * { box-sizing:border-box; }
 [hidden] { display:none !important; }
 html { font-size:17px; scroll-padding-top:5rem; }
@@ -1793,15 +1904,22 @@ body { margin:0; color:var(--ink); background:var(--paper); font-family:Inter,ui
 .home:hover { color:var(--accent); background:var(--accent-soft); }
 .mark { display:grid; place-items:center; width:2rem; height:2rem; border-radius:.55rem; color:white; background:var(--accent); font:700 .68rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:-.04em; transform:rotate(-3deg); }
 .filename { overflow:hidden; color:var(--muted); font:600 .8rem/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
-.top-actions { display:flex; gap:.55rem; margin-left:auto; }
+.top-actions { display:flex; align-items:center; gap:.55rem; margin-left:auto; }
 .button,.format-tools button { border:1px solid var(--line); border-radius:.5rem; color:white; background:var(--accent); font:650 .78rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
 .button { display:inline-grid; place-items:center; min-height:2rem; padding:.5rem .8rem; text-decoration:none; }
 .button.ghost { color:var(--ink); background:var(--surface); }
 .button.danger { border-color:#bd3e52; background:#bd3e52; }
 .button:hover,.format-tools button:hover { filter:brightness(.96); transform:translateY(-1px); }
-.reader-layout { display:grid; grid-template-columns:180px minmax(0,920px); gap:2rem; justify-content:center; width:min(100% - 2rem,1140px); margin:clamp(1.25rem,5vw,4rem) auto; }
+.button:active,.format-tools button:active { transform:translateY(1px); }
+.identity-button { max-width:11rem; overflow:hidden; padding:.4rem .6rem; border:0; color:var(--muted); background:transparent; font:600 .72rem/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+.identity-button:hover { color:var(--accent); }
+.review-toggle b { min-width:1.15rem; padding:.12rem .3rem; border-radius:.3rem; color:var(--accent); background:var(--accent-soft); font:700 .64rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; font-variant-numeric:tabular-nums; }
+.reader-layout { display:grid; grid-template-areas:"toc paper review"; grid-template-columns:170px minmax(0,820px) minmax(280px,340px); gap:1.5rem; justify-content:center; width:min(100% - 2rem,1390px); margin:clamp(1.25rem,4vw,3.5rem) auto; }
+body.review-closed .reader-layout { grid-template-areas:"toc paper"; grid-template-columns:180px minmax(0,920px); width:min(100% - 2rem,1140px); }
+body.review-closed .review-panel { display:none; }
 main.paper { width:100%; margin:0; padding:clamp(1.25rem,5vw,4.6rem); border:1px solid var(--line); border-radius:1.1rem; background:var(--surface); box-shadow:0 24px 70px rgba(54,59,92,.09); }
-#toc { position:sticky; top:5rem; align-self:start; max-height:calc(100vh - 7rem); overflow:auto; padding:.35rem; font-size:.74rem; }
+#toc { grid-area:toc; position:sticky; top:5rem; align-self:start; max-height:calc(100vh - 7rem); overflow:auto; padding:.35rem; font-size:.74rem; }
+main.paper { grid-area:paper; }
 #toc:empty { display:none; }
 #toc::before { display:block; margin:0 0 .7rem .55rem; color:var(--muted); content:"ON THIS PAGE"; font:700 .62rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.1em; }
 #toc a { display:block; width:max-content; min-width:100%; padding:.35rem .55rem; border-left:1px solid var(--line); color:var(--muted); text-decoration:none; white-space:nowrap; }
@@ -1832,6 +1950,73 @@ li + li { margin-top:.25rem; }
 input[type="checkbox"] { width:1rem; height:1rem; margin-right:.45rem; accent-color:var(--accent); }
 sup { line-height:0; }
 :focus-visible { outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent); outline-offset:3px; border-radius:.2rem; }
+.source-run { border-radius:.15rem; transition:background .18s ease,box-shadow .18s ease; }
+.source-run.has-review { background:color-mix(in srgb,var(--comment) 72%,transparent); box-shadow:0 0 0 2px color-mix(in srgb,var(--comment) 52%,transparent); cursor:pointer; }
+.source-run.has-addressed-review { background:color-mix(in srgb,var(--accent-soft) 68%,transparent); box-shadow:0 0 0 2px color-mix(in srgb,var(--accent-soft) 52%,transparent); cursor:pointer; }
+.source-run.review-target { background:color-mix(in srgb,var(--comment) 92%,var(--surface)); box-shadow:0 0 0 4px color-mix(in srgb,var(--comment-line) 38%,transparent); }
+.review-panel { grid-area:review; position:sticky; top:4.65rem; align-self:start; display:flex; flex-direction:column; max-height:calc(100vh - 6rem); max-height:calc(100dvh - 6rem); overflow:hidden; border:1px solid var(--line); border-radius:.9rem; background:var(--surface); box-shadow:0 18px 50px rgba(54,59,92,.08); }
+.review-header { display:flex; align-items:center; justify-content:space-between; padding:1rem 1rem .75rem; }
+.review-header div { display:grid; gap:.32rem; }
+.review-header span,.dialog-kicker { color:var(--accent); font:750 .6rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.13em; }
+.review-header strong { font:650 1rem/1.2 ui-sans-serif,-apple-system,sans-serif; }
+.review-header button { display:none; width:2rem; height:2rem; padding:0; border:0; color:var(--muted); background:transparent; font-size:1.35rem; cursor:pointer; }
+.review-presence { display:flex; align-items:flex-start; gap:.5rem; min-height:2.15rem; padding:.55rem 1rem; border-block:1px solid var(--line); color:var(--muted); background:var(--paper); font-size:.7rem; line-height:1.45; }
+.review-presence i { flex:0 0 auto; width:.45rem; height:.45rem; margin-top:.25rem; border-radius:50%; background:var(--success); box-shadow:0 0 0 .18rem color-mix(in srgb,var(--success) 14%,transparent); }
+.document-comment { margin:.8rem 1rem 0; padding:.62rem .75rem; border:1px dashed color-mix(in srgb,var(--accent) 42%,var(--line)); border-radius:.55rem; color:var(--accent); background:var(--accent-soft); font:650 .75rem/1 ui-sans-serif,-apple-system,sans-serif; text-align:left; cursor:pointer; }
+.document-comment:hover { border-style:solid; }
+.review-composer { margin:.8rem 1rem 0; padding:.8rem; border-left:3px solid var(--accent); background:var(--paper); }
+.review-composer p { max-height:4.5rem; overflow:auto; margin:0 0 .6rem; color:var(--muted); font:.68rem/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; }
+.review-composer label { display:block; margin-bottom:.42rem; color:var(--ink); font-size:.72rem; font-weight:650; }
+.review-composer textarea,.reply-box textarea { width:100%; resize:vertical; padding:.65rem; border:1px solid var(--line); border-radius:.45rem; color:var(--ink); background:var(--surface); font:500 .78rem/1.55 ui-sans-serif,-apple-system,sans-serif; }
+.review-composer > div,.reply-box > div { display:flex; justify-content:flex-end; gap:.45rem; margin-top:.5rem; }
+.text-button { padding:.45rem .55rem; border:0; color:var(--muted); background:transparent; font:650 .72rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
+.text-button:hover { color:var(--accent); }
+.review-filters { display:grid; grid-template-columns:repeat(3,1fr); margin-top:.8rem; padding:0 1rem; border-bottom:1px solid var(--line); }
+.review-filters button { display:flex; justify-content:center; gap:.25rem; padding:.65rem .2rem; border:0; border-bottom:2px solid transparent; color:var(--muted); background:transparent; font:600 .68rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
+.review-filters button.active { border-bottom-color:var(--accent); color:var(--accent); }
+.review-filters b { font-variant-numeric:tabular-nums; }
+.review-complete { display:grid; gap:.2rem; margin:.85rem 1rem 0; padding:.75rem; border-left:3px solid var(--success); color:var(--success); background:color-mix(in srgb,var(--success) 8%,var(--surface)); }
+.review-complete strong { font-size:.78rem; }
+.review-complete span { font-size:.7rem; }
+.review-error { margin:.8rem 1rem 0; padding:.7rem; border-left:3px solid #bd3e52; color:#bd3e52; background:color-mix(in srgb,#bd3e52 8%,var(--surface)); font-size:.72rem; }
+.comment-list { flex:1; overflow:auto; padding:.85rem 1rem 1rem; }
+.comment-empty { padding:2.5rem .75rem; color:var(--muted); font-size:.76rem; text-align:center; }
+.comment-card { padding:.85rem 0 1rem; border-bottom:1px solid var(--line); scroll-margin-top:1rem; }
+.comment-card:first-child { padding-top:0; }
+.comment-card:last-child { border-bottom:0; }
+.comment-card.active { margin-inline:-.55rem; padding-inline:.55rem; background:var(--accent-soft); }
+.comment-meta { display:flex; align-items:center; justify-content:space-between; gap:.5rem; margin-bottom:.55rem; }
+.comment-status { color:var(--comment-line); font:750 .62rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.05em; }
+.comment-status.addressed { color:var(--addressed); }
+.comment-status.resolved { color:var(--success); }
+.comment-scope { overflow:hidden; margin:0 0 .65rem; padding:.48rem .6rem; border-left:2px solid var(--comment-line); color:var(--muted); background:color-mix(in srgb,var(--comment) 42%,var(--surface)); font:.68rem/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:pre-wrap; }
+.comment-scope.stale { border-left-color:#bd3e52; color:#a83a4c; background:color-mix(in srgb,#bd3e52 7%,var(--surface)); }
+.message { display:grid; gap:.28rem; margin-top:.7rem; }
+.message header { display:flex; justify-content:space-between; gap:.5rem; color:var(--muted); font-size:.63rem; }
+.message header strong { overflow:hidden; color:var(--ink); font:650 .67rem/1.3 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+.message p { margin:0; color:var(--ink); font-size:.76rem; line-height:1.55; white-space:pre-wrap; overflow-wrap:anywhere; }
+.message-tools { display:flex; gap:.2rem; margin-top:.18rem; }
+.message-tools button { padding:.25rem .3rem; border:0; color:var(--muted); background:transparent; font:600 .62rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
+.message-tools button:hover { color:var(--accent); }
+.message-tools button[data-confirming="true"] { color:#bd3e52; }
+.message-editor { margin-top:.45rem; }
+.message-editor textarea { width:100%; resize:vertical; padding:.55rem .6rem; border:1px solid var(--line); border-radius:.4rem; color:var(--ink); background:var(--surface); font:500 .75rem/1.5 ui-sans-serif,-apple-system,sans-serif; }
+.message-editor div { display:flex; justify-content:flex-end; gap:.35rem; margin-top:.4rem; }
+.comment-actions { display:flex; flex-wrap:wrap; gap:.35rem; margin-top:.8rem; }
+.comment-actions button { padding:.4rem .52rem; border:1px solid var(--line); border-radius:.4rem; color:var(--muted); background:var(--surface); font:650 .67rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
+.comment-actions button.primary { border-color:var(--accent); color:white; background:var(--accent); }
+.comment-actions button[data-confirming="true"] { border-color:#bd3e52; color:#bd3e52; }
+.reply-box { margin-top:.65rem; }
+.selection-comment { position:fixed; z-index:8; padding:.55rem .7rem; border:1px solid color-mix(in srgb,var(--accent) 55%,var(--line)); border-radius:.5rem; color:white; background:var(--accent); box-shadow:0 10px 28px rgba(54,59,92,.22); font:650 .72rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; transform:translate(-50%,-100%); }
+.toast { position:fixed; z-index:10; right:1rem; bottom:1rem; max-width:min(24rem,calc(100vw - 2rem)); padding:.7rem .9rem; border:1px solid var(--line); border-radius:.55rem; color:var(--ink); background:var(--surface); box-shadow:0 16px 45px rgba(54,59,92,.18); font-size:.75rem; }
+.identity-dialog { width:min(92vw,430px); padding:0; border:1px solid var(--line); border-radius:1rem; color:var(--ink); background:var(--surface); box-shadow:0 28px 90px rgba(35,38,61,.24); }
+.identity-dialog::backdrop { background:rgba(20,22,34,.52); backdrop-filter:blur(5px); }
+.identity-dialog form { display:grid; gap:.8rem; padding:1.5rem; }
+.identity-dialog h2 { margin:0; padding:0; border:0; font:650 1.35rem/1.25 ui-sans-serif,-apple-system,sans-serif; }
+.identity-dialog p { margin:0; color:var(--muted); font-size:.78rem; line-height:1.6; }
+.identity-dialog label { margin-top:.25rem; font-size:.72rem; font-weight:650; }
+.identity-dialog input { width:100%; padding:.72rem .8rem; border:1px solid var(--line); border-radius:.5rem; color:var(--ink); background:var(--paper); font:550 .82rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.identity-error { min-height:1em; color:#bd3e52; font-size:.68rem; }
 .editor-shell { display:flex; flex-direction:column; height:calc(100vh - 3.4rem); height:calc(100dvh - 3.4rem); overflow:hidden; background:var(--surface); }
 .editor-toolbar { display:flex; flex:0 0 auto; align-items:center; gap:.6rem; min-height:3.5rem; padding:.6rem max(1rem,calc((100vw - 1400px)/2)); border-bottom:1px solid var(--line); }
 .format-tools { display:flex; gap:.3rem; overflow-x:auto; }
@@ -1852,9 +2037,10 @@ sup { line-height:0; }
 main.preview-paper { width:100%; margin:0; padding:2rem; border:0; border-radius:0; box-shadow:none; }
 .sync-anchor { display:block; overflow:hidden; width:0; height:0; pointer-events:none; }
 body.editing { overflow:hidden; }
-@media (max-width:900px) { .reader-layout { display:block; } #toc { display:none; } }
-@media (max-width:700px) { html { font-size:16px; } .reader-layout { display:block; width:100%; margin:0; } main.paper { padding:1.5rem 1rem 3rem; border-width:0; border-radius:0; box-shadow:none; } .topbar { padding-inline:.7rem; } .mark { display:none; } .editor-panes { grid-template-columns:1fr; grid-template-rows:1fr 1fr; } .preview-pane { border-right:0; border-bottom:1px solid var(--line); } .collaboration-status { margin-left:auto; } #save-status { display:none; } }
-@media (prefers-color-scheme:dark) { :root { --paper:#11131b; --surface:#191c27; --ink:#edf0f7; --muted:#a7adbd; --line:#303545; --accent:#a9a5ff; --accent-soft:#292943; --code:#0d0f16; --code-ink:#e7e9f3; --quote:#20283a; } body { background-image:radial-gradient(circle at 50% -20%,#252943 0,transparent 38rem); } code { color:#f2a7ca; } main { box-shadow:0 24px 70px rgba(0,0,0,.25); } }
+@media (max-width:1180px) { .reader-layout { grid-template-areas:"paper review"; grid-template-columns:minmax(0,820px) minmax(280px,340px); width:min(100% - 2rem,1180px); } body.review-closed .reader-layout { grid-template-areas:"paper"; grid-template-columns:minmax(0,920px); width:min(100% - 2rem,920px); } #toc { display:none; } }
+@media (max-width:900px) { .reader-layout,body.review-closed .reader-layout { display:block; width:min(100% - 2rem,820px); } .review-panel { position:fixed; z-index:7; top:3.4rem; right:0; bottom:0; width:min(92vw,370px); max-height:none; border-radius:0; transform:translateX(0); transition:transform .22s ease; } body.review-closed .review-panel { display:flex; transform:translateX(100%); pointer-events:none; } .review-header button { display:block; } }
+@media (max-width:700px) { html { font-size:16px; } .reader-layout,body.review-closed .reader-layout { width:100%; margin:0; } main.paper { padding:1.5rem 1rem 3rem; border-width:0; border-radius:0; box-shadow:none; } .topbar { padding-inline:.7rem; } .mark,.identity-button,.raw-button { display:none; } .editor-panes { grid-template-columns:1fr; grid-template-rows:1fr 1fr; } .preview-pane { border-right:0; border-bottom:1px solid var(--line); } .collaboration-status { margin-left:auto; } #save-status { display:none; } }
+@media (prefers-color-scheme:dark) { :root { --paper:#11131b; --surface:#191c27; --ink:#edf0f7; --muted:#a7adbd; --line:#303545; --accent:#a9a5ff; --accent-soft:#292943; --code:#0d0f16; --code-ink:#e7e9f3; --quote:#20283a; --comment:#5d4b20; --comment-line:#d9ad43; --addressed:#e0ae63; --success:#6fc394; } body { background-image:radial-gradient(circle at 50% -20%,#252943 0,transparent 38rem); } code { color:#f2a7ca; } main { box-shadow:0 24px 70px rgba(0,0,0,.25); } }
 @media (prefers-reduced-motion:no-preference) { main.paper { animation:arrive .35s ease-out both; } @keyframes arrive { from { opacity:0; transform:translateY(8px); } } }
 "#;
 
@@ -1866,6 +2052,21 @@ const preview = document.querySelector('#preview');
 const status = document.querySelector('#save-status');
 const presence = document.querySelector('#presence');
 const connectionDot = document.querySelector('#connection-dot');
+const article = document.querySelector('#article');
+const reviewPanel = document.querySelector('#review-panel');
+const commentList = document.querySelector('#comment-list');
+const reviewError = document.querySelector('#review-error');
+const reviewUsers = document.querySelector('#review-users');
+const selectionComment = document.querySelector('#selection-comment');
+const reviewComposer = document.querySelector('#review-composer');
+const composerScope = document.querySelector('#composer-scope');
+const commentBody = document.querySelector('#comment-body');
+const identityDialog = document.querySelector('#identity-dialog');
+const identityInput = document.querySelector('#identity-input');
+const identityError = document.querySelector('#identity-error');
+const identityButton = document.querySelector('#identity-button');
+const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity';
+commentBody.placeholder = 'Enter 提交 · ⌘ Enter 换行';
 const LOCAL_ORIGIN = Symbol('local-input');
 const REMOTE_ORIGIN = Symbol('remote-update');
 let documentState = new Y.Doc();
@@ -1886,6 +2087,16 @@ let sequence = 0;
 let latestGeneration = 0;
 let savedGeneration = 0;
 const pending = new Set();
+let reviewDocument = {version: 1, comments: []};
+let reviewFilter = 'open';
+let reviewIdentity = '';
+let reviewSocket;
+let reviewReconnectTimer;
+let reviewReconnectDelay = 500;
+let pendingCommentScope = null;
+let pendingSelectionLabel = '';
+let selectedCommentId = null;
+let pendingIdentityAction = null;
 
 function setStatus(message, state = '') {
   status.textContent = message;
@@ -2215,7 +2426,551 @@ function prefixLines(prefix) {
   source.focus();
   syncTextareaChange();
 }
+
+function escapeReviewHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
+}
+function reviewStatusLabel(value) {
+  return {open: '待处理', addressed: '待确认', resolved: '已解决'}[value] || value;
+}
+function showReviewError(message = '') {
+  reviewError.textContent = message;
+  reviewError.hidden = !message;
+}
+function showReviewToast(message) {
+  const toast = document.querySelector('#review-toast');
+  toast.textContent = message;
+  toast.hidden = false;
+  clearTimeout(showReviewToast.timer);
+  showReviewToast.timer = setTimeout(() => { toast.hidden = true; }, 2200);
+}
+function validReviewIdentity(value) {
+  return value.trim().length > 0;
+}
+function openIdentityDialog() {
+  identityInput.value = reviewIdentity || '';
+  identityError.textContent = '';
+  if (!identityDialog.open) identityDialog.showModal();
+  setTimeout(() => identityInput.focus(), 0);
+}
+function setReviewIdentity(value) {
+  reviewIdentity = value.trim();
+  localStorage.setItem(REVIEW_IDENTITY_KEY, reviewIdentity);
+  identityButton.textContent = reviewIdentity;
+  identityButton.title = `${reviewIdentity} · 点击切换身份`;
+  identityDialog.close();
+  connectReview();
+  const action = pendingIdentityAction;
+  pendingIdentityAction = null;
+  action?.();
+}
+function ensureReviewIdentity() {
+  const saved = localStorage.getItem(REVIEW_IDENTITY_KEY) || '';
+  if (validReviewIdentity(saved)) {
+    reviewIdentity = saved;
+    identityButton.textContent = saved;
+    identityButton.title = `${saved} · 点击切换身份`;
+  } else {
+    identityButton.textContent = '设置名称';
+    identityButton.title = '设置审阅人名称';
+  }
+  connectReview();
+}
+function requireReviewIdentity(action) {
+  if (validReviewIdentity(reviewIdentity)) {
+    action();
+    return;
+  }
+  pendingIdentityAction = action;
+  openIdentityDialog();
+}
+async function loadReview() {
+  try {
+    const response = await fetch(`${location.pathname}?mode=review-data`, {cache: 'no-store'});
+    if (!response.ok) throw new Error((await response.text()).trim() || '无法读取审阅数据');
+    reviewDocument = await response.json();
+    if (!Array.isArray(reviewDocument.comments)) reviewDocument.comments = [];
+    showReviewError();
+    renderReview();
+  } catch (error) {
+    showReviewError(error.message);
+    commentList.innerHTML = '<div class="comment-empty">审阅数据暂时不可用，正文仍可正常阅读和编辑。</div>';
+  }
+}
+async function postReviewAction(action) {
+  showReviewError();
+  const response = await fetch(`${location.pathname}?mode=review-action`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json; charset=utf-8'},
+    body: JSON.stringify(action)
+  });
+  if (!response.ok) throw new Error((await response.text()).trim() || '无法保存评论');
+  reviewDocument = await response.json();
+  renderReview();
+}
+function connectReview() {
+  clearTimeout(reviewReconnectTimer);
+  reviewSocket?.close(1000, 'identity changed');
+  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${scheme}//${location.host}${location.pathname}?mode=review-collab`);
+  reviewSocket = socket;
+  reviewUsers.textContent = '正在连接…';
+  socket.addEventListener('open', () => {
+    reviewReconnectDelay = 500;
+    if (validReviewIdentity(reviewIdentity)) {
+      socket.send(JSON.stringify({type: 'join', user: reviewIdentity}));
+    }
+  });
+  socket.addEventListener('message', event => {
+    let message;
+    try { message = JSON.parse(event.data); } catch (_) { return; }
+    if (message.type === 'review-updated') loadReview();
+    else if (message.type === 'review-presence') {
+      const users = Array.isArray(message.users) ? message.users : [];
+      reviewUsers.textContent = users.length ? users.join(' · ') : '暂无在线审阅者';
+    } else if (message.type === 'review-error') showReviewError(message.message || '审阅同步失败');
+  });
+  socket.addEventListener('close', () => {
+    if (reviewSocket !== socket) return;
+    reviewUsers.textContent = '连接已断开，正在重连…';
+    reviewReconnectTimer = setTimeout(connectReview, reviewReconnectDelay);
+    reviewReconnectDelay = Math.min(reviewReconnectDelay * 2, 5000);
+  });
+  socket.addEventListener('error', () => {
+    if (reviewSocket === socket) reviewUsers.textContent = '审阅连接失败';
+  });
+}
+function findUnique(haystack, needle) {
+  if (!needle) return -1;
+  const first = haystack.indexOf(needle);
+  if (first < 0 || haystack.indexOf(needle, first + 1) >= 0) return -1;
+  return first;
+}
+function resolveReviewScope(scope) {
+  if (!scope || scope.type !== 'range') return null;
+  const text = source.value;
+  const quote = String(scope.quote || '');
+  let start = Number(scope.start);
+  let end = Number(scope.end);
+  if (Number.isFinite(start) && Number.isFinite(end) && text.slice(start, end) === quote) {
+    return {start, end, stale: false};
+  }
+  const prefix = String(scope.prefix || '');
+  const suffix = String(scope.suffix || '');
+  const contextual = `${prefix}${quote}${suffix}`;
+  let found = findUnique(text, contextual);
+  if (found >= 0) {
+    start = found + prefix.length;
+    return {start, end: start + quote.length, stale: false};
+  }
+  found = findUnique(text, quote);
+  if (found >= 0) return {start: found, end: found + quote.length, stale: false};
+  return {start: -1, end: -1, stale: true};
+}
+function markReviewRanges(resolvedScopes) {
+  article.querySelectorAll('.source-run').forEach(run => {
+    run.classList.remove('has-review', 'has-addressed-review');
+    delete run.dataset.commentIds;
+  });
+  reviewDocument.comments.forEach(comment => {
+    if (comment.status === 'resolved') return;
+    const resolved = resolvedScopes.get(comment.id);
+    if (!resolved || resolved.stale) return;
+    article.querySelectorAll('.source-run').forEach(run => {
+      const start = Number(run.dataset.sourceStart);
+      const end = Number(run.dataset.sourceEnd);
+      if (end <= resolved.start || start >= resolved.end) return;
+      run.classList.add(comment.status === 'addressed' ? 'has-addressed-review' : 'has-review');
+      const ids = run.dataset.commentIds ? run.dataset.commentIds.split(',') : [];
+      if (!ids.includes(comment.id)) ids.push(comment.id);
+      run.dataset.commentIds = ids.join(',');
+    });
+  });
+}
+function scrollToCommentSource(commentId) {
+  const comment = reviewDocument.comments.find(item => item.id === commentId);
+  if (!comment) return;
+  const reduceMotion = matchMedia('(prefers-reduced-motion:reduce)').matches;
+  if (matchMedia('(max-width:900px)').matches) {
+    document.body.classList.add('review-closed');
+    document.querySelector('#review-toggle').setAttribute('aria-expanded', 'false');
+  }
+  if (comment.scope?.type === 'document') {
+    article.scrollIntoView({behavior: reduceMotion ? 'auto' : 'smooth', block: 'start'});
+    return;
+  }
+  const resolved = resolveReviewScope(comment.scope);
+  if (!resolved || resolved.stale) {
+    showReviewToast('原文已变化，无法定位这条评论');
+    return;
+  }
+  const runs = Array.from(article.querySelectorAll('.source-run')).filter(run => {
+    const start = Number(run.dataset.sourceStart);
+    const end = Number(run.dataset.sourceEnd);
+    return end > resolved.start && start < resolved.end;
+  });
+  if (!runs.length) {
+    showReviewToast('没有找到对应的正文文本');
+    return;
+  }
+  article.querySelectorAll('.review-target').forEach(run => run.classList.remove('review-target'));
+  runs.forEach(run => run.classList.add('review-target'));
+  runs[0].scrollIntoView({behavior: reduceMotion ? 'auto' : 'smooth', block: 'center'});
+  setTimeout(() => runs.forEach(run => run.classList.remove('review-target')), 1800);
+}
+function messageMarkup(message, index, commentId) {
+  const date = new Date(message.created_at);
+  const shownDate = Number.isNaN(date.getTime()) ? message.created_at : date.toLocaleString();
+  const edited = message.edited_at ? ' · 已编辑' : '';
+  return `<section class="message" data-comment-id="${escapeReviewHtml(commentId)}" data-message-id="${escapeReviewHtml(message.id || '')}" data-message-index="${index}"><header><strong>${escapeReviewHtml(message.author)}</strong><span><time>${escapeReviewHtml(shownDate)}</time>${edited}</span></header><p>${escapeReviewHtml(message.body)}</p><div class="message-tools"><button type="button" data-message-action="edit">修改</button><button type="button" data-message-action="delete">删除</button></div></section>`;
+}
+function commentMarkup(comment, resolved) {
+  const documentScope = comment.scope?.type === 'document';
+  const quote = documentScope
+    ? '全文评论'
+    : (comment.scope?.display_quote || comment.scope?.quote || '选区评论');
+  const stale = !documentScope && resolved?.stale;
+  let buttons = '<button type="button" data-comment-action="reply">回复</button>';
+  if (comment.status === 'open') {
+    buttons += '<button class="primary" type="button" data-comment-action="resolve">标记解决</button>';
+  } else if (comment.status === 'addressed') {
+    buttons += '<button class="primary" type="button" data-comment-action="resolve">确认解决</button><button type="button" data-comment-action="reopen">重新打开</button>';
+  } else if (comment.status === 'resolved') {
+    buttons += '<button type="button" data-comment-action="reopen">重新打开</button>';
+  }
+  buttons += '<button type="button" data-comment-action="delete-comment">删除整条评论</button>';
+  return `<article class="comment-card${selectedCommentId === comment.id ? ' active' : ''}" data-comment-id="${escapeReviewHtml(comment.id)}" title="双击定位正文"><div class="comment-meta"><span class="comment-status ${escapeReviewHtml(comment.status)}">${escapeReviewHtml(reviewStatusLabel(comment.status))}</span><span>${comment.messages.length} 条消息</span></div><p class="comment-scope${stale ? ' stale' : ''}">${stale ? '原文已变化 · ' : ''}${escapeReviewHtml(quote)}</p>${comment.messages.map((message, index) => messageMarkup(message, index, comment.id)).join('')}<div class="comment-actions">${buttons}</div></article>`;
+}
+function renderReview() {
+  const comments = reviewDocument.comments || [];
+  const counts = {open: 0, addressed: 0, resolved: 0};
+  comments.forEach(comment => { if (counts[comment.status] !== undefined) counts[comment.status] += 1; });
+  document.querySelectorAll('[data-review-filter]').forEach(button => {
+    button.classList.toggle('active', button.dataset.reviewFilter === reviewFilter);
+    button.querySelector('b').textContent = counts[button.dataset.reviewFilter] || 0;
+  });
+  document.querySelector('#review-count').textContent = counts.open + counts.addressed;
+  document.querySelector('#review-complete').hidden = comments.length === 0 || counts.open + counts.addressed > 0;
+  const resolvedScopes = new Map(comments.map(comment => [comment.id, resolveReviewScope(comment.scope)]));
+  const visible = comments
+    .map((comment, index) => ({comment, index, resolved: resolvedScopes.get(comment.id)}))
+    .filter(item => item.comment.status === reviewFilter)
+    .sort((left, right) => {
+      const position = item => {
+        if (item.comment.scope?.type === 'document') return -1;
+        if (!item.resolved || item.resolved.stale) return Number.POSITIVE_INFINITY;
+        return item.resolved.start;
+      };
+      return position(left) - position(right) || left.index - right.index;
+    });
+  commentList.innerHTML = visible.length
+    ? visible.map(item => commentMarkup(item.comment, item.resolved)).join('')
+    : `<div class="comment-empty">${reviewFilter === 'open' ? '暂无待处理评论。划选正文即可添加批注。' : `暂无${reviewStatusLabel(reviewFilter)}评论。`}</div>`;
+  markReviewRanges(resolvedScopes);
+  if (selectedCommentId) {
+    requestAnimationFrame(() => commentList.querySelector(`[data-comment-id="${CSS.escape(selectedCommentId)}"]`)?.scrollIntoView({block: 'nearest'}));
+  }
+}
+function sourceRunForBoundary(node) {
+  const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  return element?.closest?.('.source-run');
+}
+function sourceOffsetAtBoundary(run, node, offset) {
+  const range = document.createRange();
+  range.selectNodeContents(run);
+  try { range.setEnd(node, offset); } catch (_) { return Number(run.dataset.sourceStart); }
+  const visibleOffset = range.toString().length;
+  const visibleLength = run.textContent.length;
+  const sourceStart = Number(run.dataset.sourceStart);
+  const sourceEnd = Number(run.dataset.sourceEnd);
+  if (visibleOffset <= 0) return sourceStart;
+  if (visibleOffset >= visibleLength) return sourceEnd;
+  if (visibleLength === sourceEnd - sourceStart) return sourceStart + visibleOffset;
+  return sourceStart + Math.round((sourceEnd - sourceStart) * visibleOffset / visibleLength);
+}
+function scopeFromSelection() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
+  const range = selection.getRangeAt(0);
+  if (!article.contains(range.commonAncestorContainer)) return null;
+  const startRun = sourceRunForBoundary(range.startContainer);
+  const endRun = sourceRunForBoundary(range.endContainer);
+  if (!startRun || !endRun) return null;
+  const start = sourceOffsetAtBoundary(startRun, range.startContainer, range.startOffset);
+  const end = sourceOffsetAtBoundary(endRun, range.endContainer, range.endOffset);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  const quote = source.value.slice(start, end);
+  if (!quote.trim()) return null;
+  return {
+    scope: {
+      type: 'range', start, end, quote,
+      display_quote: selection.toString(),
+      prefix: source.value.slice(Math.max(0, start - 64), start),
+      suffix: source.value.slice(end, end + 64)
+    },
+    label: selection.toString()
+  };
+}
+function updateSelectionComment() {
+  if (editing || !reader.contains(document.activeElement) && reviewPanel.contains(document.activeElement)) return;
+  const selected = scopeFromSelection();
+  if (!selected) {
+    selectionComment.hidden = true;
+    return;
+  }
+  pendingCommentScope = selected.scope;
+  pendingSelectionLabel = selected.label;
+  const range = window.getSelection().getRangeAt(0);
+  const rect = range.getBoundingClientRect();
+  selectionComment.style.left = `${Math.min(innerWidth - 70, Math.max(70, rect.left + rect.width / 2))}px`;
+  selectionComment.style.top = `${Math.max(54, rect.top - 7)}px`;
+  selectionComment.hidden = false;
+}
+function openReviewPanel() {
+  document.body.classList.remove('review-closed');
+  document.querySelector('#review-toggle').setAttribute('aria-expanded', 'true');
+}
+function openComposer(scope, label) {
+  openReviewPanel();
+  pendingCommentScope = scope;
+  pendingSelectionLabel = label;
+  composerScope.textContent = scope.type === 'document' ? '针对全文' : `“${label.trim()}”`;
+  reviewComposer.hidden = false;
+  commentBody.value = '';
+  commentBody.focus();
+}
+function closeComposer() {
+  reviewComposer.hidden = true;
+  commentBody.value = '';
+  pendingCommentScope = null;
+  pendingSelectionLabel = '';
+}
+function newReviewId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+async function submitComment() {
+  if (!validReviewIdentity(reviewIdentity)) return requireReviewIdentity(submitComment);
+  const body = commentBody.value.trim();
+  if (!body || !pendingCommentScope) return;
+  const action = {
+    type: 'add-comment',
+    comment: {
+      id: newReviewId(), scope: pendingCommentScope, status: 'open',
+      messages: [{id: newReviewId(), author: reviewIdentity, body, created_at: new Date().toISOString()}]
+    }
+  };
+  try {
+    await postReviewAction(action);
+    closeComposer();
+    window.getSelection()?.removeAllRanges();
+    selectionComment.hidden = true;
+    reviewFilter = 'open';
+    renderReview();
+    showReviewToast('评论已保存');
+  } catch (error) { showReviewError(error.message); }
+}
+function openReply(card) {
+  card.querySelector('.reply-box')?.remove();
+  const box = document.createElement('div');
+  box.className = 'reply-box';
+  box.innerHTML = '<textarea rows="3" aria-label="回复内容" placeholder="Enter 提交 · ⌘ Enter 换行"></textarea><div><button class="text-button" type="button" data-reply-cancel>取消</button><button class="button" type="button" data-reply-submit>发送回复</button></div>';
+  card.append(box);
+  box.querySelector('textarea').focus();
+}
+async function handleCommentAction(button) {
+  const card = button.closest('.comment-card');
+  const commentId = card?.dataset.commentId;
+  if (!commentId) return;
+  const action = button.dataset.commentAction;
+  if (action === 'reply') return requireReviewIdentity(() => openReply(card));
+  if (action === 'delete-comment') {
+    if (button.dataset.confirming === 'true') {
+      try {
+        await postReviewAction({type: 'delete-comment', comment_id: commentId});
+        showReviewToast('整条评论已删除');
+      } catch (error) { showReviewError(error.message); }
+      return;
+    }
+    button.dataset.confirming = 'true';
+    button.textContent = '确认删除整条评论';
+    setTimeout(() => {
+      if (!button.isConnected) return;
+      delete button.dataset.confirming;
+      button.textContent = '删除整条评论';
+    }, 3000);
+    return;
+  }
+  const status = action === 'resolve' ? 'resolved' : 'open';
+  try {
+    await postReviewAction({type: 'set-status', comment_id: commentId, status});
+    showReviewToast(status === 'resolved' ? '已确认解决' : '评论已重新打开');
+  } catch (error) { showReviewError(error.message); }
+}
+async function submitReply(card) {
+  if (!validReviewIdentity(reviewIdentity)) return requireReviewIdentity(() => submitReply(card));
+  const textarea = card.querySelector('.reply-box textarea');
+  const body = textarea?.value.trim();
+  if (!body) return;
+  const comment = reviewDocument.comments.find(item => item.id === card.dataset.commentId);
+  try {
+    await postReviewAction({
+      type: 'add-message', comment_id: card.dataset.commentId,
+      message: {id: newReviewId(), author: reviewIdentity, body, created_at: new Date().toISOString()},
+      status: comment?.status === 'open' ? null : 'open'
+    });
+    showReviewToast('回复已保存');
+  } catch (error) { showReviewError(error.message); }
+}
+function messageReference(messageElement) {
+  return {
+    comment_id: messageElement.dataset.commentId,
+    message_id: messageElement.dataset.messageId || null,
+    message_index: Number(messageElement.dataset.messageIndex)
+  };
+}
+function openMessageEditor(messageElement) {
+  messageElement.querySelector('.message-editor')?.remove();
+  const editor = document.createElement('div');
+  editor.className = 'message-editor';
+  editor.innerHTML = '<textarea rows="3" aria-label="修改消息" placeholder="Enter 提交 · ⌘ Enter 换行"></textarea><div><button class="text-button" type="button" data-message-edit-cancel>取消</button><button class="button" type="button" data-message-edit-submit>保存修改</button></div>';
+  editor.querySelector('textarea').value = messageElement.querySelector('p').textContent;
+  messageElement.append(editor);
+  editor.querySelector('textarea').focus();
+}
+async function submitMessageEdit(messageElement) {
+  const body = messageElement.querySelector('.message-editor textarea')?.value.trim();
+  if (!body) return;
+  try {
+    await postReviewAction({
+      type: 'edit-message', ...messageReference(messageElement), body,
+      edited_at: new Date().toISOString()
+    });
+    showReviewToast('消息已修改');
+  } catch (error) { showReviewError(error.message); }
+}
+async function deleteMessage(messageElement) {
+  try {
+    await postReviewAction({type: 'delete-message', ...messageReference(messageElement)});
+    showReviewToast('消息已删除');
+  } catch (error) { showReviewError(error.message); }
+}
 document.querySelector('#edit-button').addEventListener('click', openEditor);
+document.querySelector('#review-toggle').addEventListener('click', () => {
+  const closing = !document.body.classList.contains('review-closed');
+  document.body.classList.toggle('review-closed', closing);
+  document.querySelector('#review-toggle').setAttribute('aria-expanded', String(!closing));
+});
+document.querySelector('#review-close').addEventListener('click', () => {
+  document.body.classList.add('review-closed');
+  document.querySelector('#review-toggle').setAttribute('aria-expanded', 'false');
+});
+identityButton.addEventListener('click', () => {
+  pendingIdentityAction = null;
+  openIdentityDialog();
+});
+identityDialog.addEventListener('cancel', () => {
+  pendingIdentityAction = null;
+});
+identityDialog.querySelector('form').addEventListener('submit', event => {
+  event.preventDefault();
+  const value = identityInput.value.trim();
+  if (!validReviewIdentity(value)) {
+    identityError.textContent = '请输入审阅人名称';
+    identityInput.focus();
+    return;
+  }
+  setReviewIdentity(value);
+});
+document.querySelector('#document-comment').addEventListener('click', () => {
+  requireReviewIdentity(() => openComposer({type: 'document'}, '全文评论'));
+});
+selectionComment.addEventListener('click', () => {
+  const scope = pendingCommentScope;
+  const label = pendingSelectionLabel;
+  if (scope) requireReviewIdentity(() => openComposer(scope, label));
+  selectionComment.hidden = true;
+});
+document.querySelector('#composer-cancel').addEventListener('click', closeComposer);
+document.querySelector('#composer-submit').addEventListener('click', submitComment);
+commentBody.addEventListener('keydown', event => {
+  if (event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  if (event.metaKey) {
+    commentBody.setRangeText('\n', commentBody.selectionStart, commentBody.selectionEnd, 'end');
+  } else submitComment();
+});
+document.querySelector('.review-filters').addEventListener('click', event => {
+  const filter = event.target.closest('[data-review-filter]')?.dataset.reviewFilter;
+  if (!filter) return;
+  reviewFilter = filter;
+  selectedCommentId = null;
+  renderReview();
+});
+commentList.addEventListener('click', event => {
+  const actionButton = event.target.closest('[data-comment-action]');
+  if (actionButton) return handleCommentAction(actionButton);
+  const messageElement = event.target.closest('.message');
+  const messageAction = event.target.closest('[data-message-action]');
+  if (messageAction?.dataset.messageAction === 'edit') {
+    return requireReviewIdentity(() => openMessageEditor(messageElement));
+  }
+  if (messageAction?.dataset.messageAction === 'delete') {
+    if (messageAction.dataset.confirming === 'true') return deleteMessage(messageElement);
+    messageAction.dataset.confirming = 'true';
+    messageAction.textContent = '确认删除';
+    setTimeout(() => {
+      if (!messageAction.isConnected) return;
+      delete messageAction.dataset.confirming;
+      messageAction.textContent = '删除';
+    }, 3000);
+    return;
+  }
+  if (event.target.closest('[data-message-edit-cancel]')) return messageElement.querySelector('.message-editor')?.remove();
+  if (event.target.closest('[data-message-edit-submit]')) return submitMessageEdit(messageElement);
+  const card = event.target.closest('.comment-card');
+  if (event.target.closest('[data-reply-cancel]')) return card.querySelector('.reply-box')?.remove();
+  if (event.target.closest('[data-reply-submit]')) return submitReply(card);
+});
+commentList.addEventListener('keydown', event => {
+  if (event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return;
+  const isReply = event.target.matches('.reply-box textarea');
+  const isEdit = event.target.matches('.message-editor textarea');
+  if (!isReply && !isEdit) return;
+  event.preventDefault();
+  if (event.metaKey) {
+    event.target.setRangeText('\n', event.target.selectionStart, event.target.selectionEnd, 'end');
+    return;
+  }
+  if (isReply) {
+    submitReply(event.target.closest('.comment-card'));
+  } else if (isEdit) {
+    submitMessageEdit(event.target.closest('.message'));
+  }
+});
+commentList.addEventListener('dblclick', event => {
+  if (event.target.closest('button,textarea')) return;
+  const commentId = event.target.closest('.comment-card')?.dataset.commentId;
+  if (commentId) scrollToCommentSource(commentId);
+});
+article.addEventListener('mouseup', () => setTimeout(updateSelectionComment, 0));
+article.addEventListener('keyup', () => setTimeout(updateSelectionComment, 0));
+article.addEventListener('click', event => {
+  const ids = event.target.closest('.source-run[data-comment-ids]')?.dataset.commentIds?.split(',');
+  if (!ids?.length || !window.getSelection()?.isCollapsed) return;
+  const comment = reviewDocument.comments.find(item => item.id === ids[0]);
+  if (!comment) return;
+  selectedCommentId = comment.id;
+  reviewFilter = comment.status;
+  openReviewPanel();
+  renderReview();
+});
+document.addEventListener('pointerdown', event => {
+  if (!selectionComment.contains(event.target) && !article.contains(event.target)) {
+    selectionComment.hidden = true;
+  }
+});
 document.querySelector('#cancel-button').addEventListener('click', () => {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     setStatus('连接恢复后才能安全退出', 'error');
@@ -2280,6 +3035,8 @@ window.addEventListener('beforeunload', event => {
   }
 });
 buildViewerTools();
+loadReview();
+ensureReviewIdentity();
 "#;
 
 fn send_text(
@@ -2487,11 +3244,22 @@ mod tests {
         );
 
         assert!(page.starts_with("<!doctype html>"));
-        assert!(page.contains("<h1>Hello</h1>"));
+        assert!(page.contains("<body class=\"review-closed\">"));
+        assert!(page.contains("id=\"review-toggle\" type=\"button\" aria-expanded=\"false\""));
+        assert!(page.contains("<h1>"));
+        assert!(page.contains(">Hello</span></h1>"));
         assert!(page.contains("<table>"));
         assert!(page.contains("type=\"checkbox\""));
         assert!(page.contains("README.md"));
         assert!(page.contains("id=\"edit-button\""));
+        assert!(page.contains("id=\"review-panel\""));
+        assert!(page.contains("id=\"identity-dialog\""));
+        assert!(page.contains("?mode=review-collab"));
+        assert!(page.contains("?mode=review-action"));
+        assert!(page.contains("commentList.addEventListener('dblclick'"));
+        assert!(page.contains("function scrollToCommentSource(commentId)"));
+        assert!(page.contains("return item.resolved.start;"));
+        assert!(page.contains("function requireReviewIdentity(action)"));
         assert!(page.contains("id=\"source\""));
         assert!(page.contains("[hidden] { display:none !important; }"));
         assert!(page.contains(".editor-shell { display:flex; flex-direction:column;"));
@@ -2563,7 +3331,18 @@ mod tests {
 
         assert!(article.contains("data-source-offset=\"0\""));
         assert!(article.contains("data-source-offset=\"4\""));
-        assert!(article.contains("<h2>title</h2>"));
+        assert!(article.contains("<h2>"));
+        assert!(article.contains(">title</span></h2>"));
+        assert!(article.contains("class=\"source-run\" data-source-start=\"0\""));
+    }
+
+    #[test]
+    fn maps_rendered_markdown_text_to_utf16_source_ranges() {
+        let article = render_markdown_article("# 😀你好\n\n**bold** and [link](target)");
+
+        assert!(article.contains("data-source-start=\"2\" data-source-end=\"6\">😀你好"));
+        assert!(article.contains("data-source-start=\"10\" data-source-end=\"14\">bold"));
+        assert!(article.contains("data-source-start=\"22\" data-source-end=\"26\">link"));
     }
 
     #[test]
@@ -2612,9 +3391,10 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let hub = CollaborationHub::default();
+        let reviews = ReviewHub::default();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle_connection(stream, &root, &hub).unwrap();
+            handle_connection(stream, &root, &hub, &reviews).unwrap();
         });
 
         let (mut socket, response) =
@@ -2765,6 +3545,121 @@ mod tests {
         assert!(page.contains("id=\"image-lightbox\""));
         assert!(page.contains("if (event.target === lightbox) closeLightbox();"));
         assert!(page.contains("if (event.key === 'Escape') closeLightbox();"));
+    }
+
+    #[test]
+    fn directory_hides_markdown_review_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("spec.md"), "# Spec").unwrap();
+        fs::write(
+            directory.path().join("spec.md.review.json"),
+            r#"{"version":1,"comments":[]}"#,
+        )
+        .unwrap();
+
+        let page = render_directory_page(directory.path(), directory.path()).unwrap();
+
+        assert!(page.contains("spec.md"));
+        assert!(!page.contains("spec.md.review.json"));
+        assert!(page.contains("1 个文件"));
+    }
+
+    #[test]
+    fn review_websocket_broadcasts_actions_and_named_presence() {
+        use tungstenite::{connect, Message};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("spec.md");
+        fs::write(&path, "# Spec").unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let collaboration = CollaborationHub::default();
+        let reviews = ReviewHub::default();
+        let server = std::thread::spawn(move || {
+            let mut connections = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                let root = root.clone();
+                let collaboration = collaboration.clone();
+                let reviews = reviews.clone();
+                connections.push(std::thread::spawn(move || {
+                    handle_connection(stream, &root, &collaboration, &reviews).unwrap();
+                }));
+            }
+            for connection in connections {
+                connection.join().unwrap();
+            }
+        });
+
+        let url = format!("ws://{address}/spec.md?mode=review-collab");
+        let (mut alice, _) = connect(&url).unwrap();
+        alice
+            .send(Message::Text(
+                serde_json::json!({"type": "join", "user": "alice@laptop"})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        let (mut bob, _) = connect(&url).unwrap();
+        bob.send(Message::Text(
+            serde_json::json!({"type": "join", "user": "bob@desktop"})
+                .to_string()
+                .into(),
+        ))
+        .unwrap();
+
+        for socket in [&mut alice, &mut bob] {
+            loop {
+                if let Message::Text(message) = socket.read().unwrap() {
+                    if message.contains("alice@laptop") && message.contains("bob@desktop") {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let action = serde_json::json!({
+            "type": "add-comment",
+            "comment": {
+                "id": "review-one",
+                "scope": {"type": "document"},
+                "status": "open",
+                "messages": [{
+                    "author": "alice@laptop",
+                    "body": "补充失败策略",
+                    "created_at": "2026-09-04T08:00:00.000Z"
+                }]
+            }
+        })
+        .to_string();
+        let mut client = TcpStream::connect(address).unwrap();
+        write!(
+            client,
+            "POST /spec.md?mode=review-action HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{action}",
+            action.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("review-one"));
+
+        for socket in [&mut alice, &mut bob] {
+            loop {
+                if let Message::Text(message) = socket.read().unwrap() {
+                    if message.contains("review-updated") {
+                        break;
+                    }
+                }
+            }
+        }
+        alice.close(None).unwrap();
+        bob.close(None).unwrap();
+        server.join().unwrap();
+        assert!(fs::read_to_string(review::sidecar_path(&path))
+            .unwrap()
+            .contains("review-one"));
     }
 
     #[test]

@@ -16,6 +16,46 @@ Markdown 文件会渲染为带目录和代码复制能力的阅读页面，
 人数展示，不包含身份、远端光标或历史版本。服务运行期间请避免绕过 HTTP 接口直接修改
 正在协同编辑的文件。
 
+Markdown 阅读页同时提供多人实时审阅。首次发表评论时输入一个审阅人名称，浏览器会在本机
+记住它；划选渲染后的正文可以添加范围批注，也可以添加全文评论。评论、回复、状态
+和在线审阅者会实时同步，已提交的内容立即保存，刷新页面不会丢失。评论按 `open`（待处理）、
+`addressed`（AI 已处理、待确认）和 `resolved`（已解决）流转。
+
+审阅数据保存在 Markdown 旁边的 `<文件名>.review.json`，例如 `spec.md.review.json`。这些
+旁车文件不会出现在目录页，但 AI 可以直接读写。AI 处理一条评论时，应修改 Markdown，
+在对应评论的 `messages` 中追加处理说明，并将 `status` 改为 `addressed`：
+范围批注的 `scope` 会包含 `type: "range"`、UTF-16 `start` / `end`、`quote`、
+`display_quote`、`prefix` 和 `suffix`；全文评论仅包含 `type: "document"`。
+
+```json
+{
+  "version": 1,
+  "comments": [
+    {
+      "id": "comment-id",
+      "scope": { "type": "document" },
+      "status": "addressed",
+      "messages": [
+        {
+          "id": "message-1",
+          "author": "reviewer@laptop",
+          "body": "补充失败处理说明",
+          "created_at": "2026-09-04T08:00:00.000Z"
+        },
+        {
+          "id": "message-2",
+          "author": "codex@workstation",
+          "body": "已补充重试失败后的行为",
+          "created_at": "2026-09-04T08:05:00.000Z"
+        }
+      ]
+    }
+  ]
+}
+```
+
+AI 直接修改旁车文件后，需要刷新浏览器载入新一轮；通过页面提交的多人评论则不需要刷新。
+
 任意文件 URL 加上 `?mode=raw` 后会跳过
 Markdown 等内容转换，直接返回原始内容。
 
