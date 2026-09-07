@@ -1876,12 +1876,7 @@ if (galleryToggle) {
     previewTrigger = null;
   };
 
-  listing.addEventListener('click', event => {
-    const imageArea = event.target.closest('.entry.image .glyph');
-    if (!listing.classList.contains('gallery') || !imageArea) return;
-    const entry = imageArea.closest('.entry[data-preview-src]');
-    if (!entry) return;
-    event.preventDefault();
+  const openLightbox = entry => {
     previewTrigger = entry;
     const name = entry.querySelector('.entry-name').textContent;
     lightboxImage.src = entry.dataset.previewSrc;
@@ -1890,6 +1885,15 @@ if (galleryToggle) {
     lightbox.hidden = false;
     document.body.classList.add('lightbox-open');
     lightboxClose.focus();
+  };
+
+  listing.addEventListener('click', event => {
+    const imageArea = event.target.closest('.entry.image .glyph');
+    if (!listing.classList.contains('gallery') || !imageArea) return;
+    const entry = imageArea.closest('.entry[data-preview-src]');
+    if (!entry) return;
+    event.preventDefault();
+    openLightbox(entry);
   });
 
   lightboxClose.addEventListener('click', closeLightbox);
@@ -1898,6 +1902,15 @@ if (galleryToggle) {
   });
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') closeLightbox();
+    if (lightbox.hidden) return;
+    let direction;
+    if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') direction = -1;
+    else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') direction = 1;
+    else return;
+    event.preventDefault();
+    const entries = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]'));
+    const nextEntry = entries[entries.indexOf(previewTrigger) + direction];
+    if (nextEntry) openLightbox(nextEntry);
   });
 
   galleryToggle.addEventListener('click', () => {
