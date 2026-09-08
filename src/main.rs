@@ -604,7 +604,7 @@ fn handle_connection(
             .and_then(|name| name.to_str())
             .unwrap_or("SVG image");
         let body = render_svg_page(title, metadata.len(), gallery_view);
-        return send_html(&mut stream, &body, head_only);
+        return send_file_page(&mut stream, &body, &canonical, head_only);
     }
 
     if is_raster_image(&canonical) && request_wants_html(&headers) {
@@ -618,7 +618,7 @@ fn handle_connection(
             .unwrap_or("IMAGE")
             .to_ascii_uppercase();
         let body = render_image_page(title, &kind, metadata.len(), gallery_view);
-        return send_html(&mut stream, &body, head_only);
+        return send_file_page(&mut stream, &body, &canonical, head_only);
     }
 
     if has_extension(&canonical, "drawio") && request_wants_html(&headers) {
@@ -649,7 +649,7 @@ fn handle_connection(
             .and_then(|name| name.to_str())
             .unwrap_or("Draw.io diagram");
         let body = render_drawio_page(&diagram, title, metadata.len());
-        return send_html(&mut stream, &body, head_only);
+        return send_file_page(&mut stream, &body, &canonical, head_only);
     }
 
     if has_extension(&canonical, "md") {
@@ -659,7 +659,7 @@ fn handle_connection(
             .and_then(|name| name.to_str())
             .unwrap_or("Markdown");
         let body = render_markdown_page(&markdown, title);
-        return send_html(&mut stream, &body, head_only);
+        return send_file_page(&mut stream, &body, &canonical, head_only);
     }
 
     if request_wants_html(&headers) && metadata.len() <= MAX_TEXT_VIEWER_FILE {
@@ -670,7 +670,7 @@ fn handle_connection(
                 text_file.kind,
                 &canonical,
             );
-            return send_html(&mut stream, &body, head_only);
+            return send_file_page(&mut stream, &body, &canonical, head_only);
         }
     }
 
@@ -905,6 +905,31 @@ fn send_empty(stream: &mut TcpStream, status: u16, reason: &str) -> io::Result<(
     )
 }
 
+const FILE_SHORTCUT_JS: &str = include_str!("../assets/file-shortcuts.js");
+
+fn send_file_page(
+    stream: &mut TcpStream,
+    body: &str,
+    path: &Path,
+    head_only: bool,
+) -> io::Result<()> {
+    let body = body
+        .replacen(
+            "<body",
+            &format!(
+                "<body data-file-path=\"{}\"",
+                escape_html(&path.to_string_lossy())
+            ),
+            1,
+        )
+        .replacen(
+            "</body>",
+            &format!("<script>{FILE_SHORTCUT_JS}</script></body>"),
+            1,
+        );
+    send_html(stream, &body, head_only)
+}
+
 fn send_html(stream: &mut TcpStream, body: &str, head_only: bool) -> io::Result<()> {
     send_content(
         stream,
@@ -1095,7 +1120,8 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
         };
         let preview = if is_image {
             format!(
-                " data-preview-src=\"{href}?mode=asset\" data-list-href=\"{href}\" data-gallery-href=\"{href}?view=gallery\""
+                " data-file-path=\"{}\" data-preview-src=\"{href}?mode=asset\" data-list-href=\"{href}\" data-gallery-href=\"{href}?view=gallery\"",
+                escape_html(&entry.path.to_string_lossy())
             )
         } else {
             String::new()
@@ -1115,7 +1141,7 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
         ""
     };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}</header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><figure><img alt=\"\"><figcaption></figcaption></figure>{GALLERY_DELETE_DIALOG}</div>\n<script>{DIRECTORY_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}</header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><figure><img alt=\"\"><figcaption></figcaption></figure>{GALLERY_DELETE_DIALOG}</div>\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
     ))
 }
 
@@ -2136,6 +2162,7 @@ if (galleryToggle) {
   const openLightbox = entry => {
     clearDeleteTimer();
     previewTrigger = entry;
+    lightbox.dataset.filePath = entry.dataset.filePath;
     const name = entry.querySelector('.entry-name').textContent;
     lightboxImage.src = entry.dataset.previewSrc;
     lightboxImage.alt = name;
@@ -2575,7 +2602,7 @@ function interpolateScroll(value, from, to) {
 function rebuildScrollMap() {
   const win = preview.contentWindow;
   const doc = preview.contentDocument;
-  if (!win || !doc || !source.clientWidth) return;
+  if (!win || !doc?.body || !source.clientWidth) return;
   const previewAnchors = Array.from(doc.querySelectorAll('.sync-anchor[data-source-offset]'));
   const offsets = [...new Set(previewAnchors.map(anchor => Number(anchor.dataset.sourceOffset)))]
     .filter(offset => Number.isFinite(offset) && offset >= 0 && offset <= source.value.length)
@@ -2629,7 +2656,7 @@ function scheduleScrollMapRebuild(syncAfter = true) {
 function syncPreviewFromSource() {
   const win = preview.contentWindow;
   const doc = preview.contentDocument;
-  if (!win || !doc) return;
+  if (!win || !doc?.body) return;
   const sourceCenter = source.scrollTop + source.clientHeight / 2;
   const mappedCenter = interpolateScroll(sourceCenter, 'source', 'preview');
   const sourceMax = Math.max(0, source.scrollHeight - source.clientHeight);
@@ -2643,7 +2670,7 @@ function syncPreviewFromSource() {
 function syncSourceFromPreview() {
   const win = preview.contentWindow;
   const doc = preview.contentDocument;
-  if (!win || !doc) return;
+  if (!win || !doc?.body) return;
   const previewCenter = win.scrollY + win.innerHeight / 2;
   const mappedCenter = interpolateScroll(previewCenter, 'preview', 'source');
   const ratio = scrollRatio(win.scrollY, documentHeight(doc), win.innerHeight);
