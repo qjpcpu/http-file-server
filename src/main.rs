@@ -1915,8 +1915,8 @@ if (galleryToggle) {
     if (event.key === 'Escape') closeLightbox();
     if (lightbox.hidden) return;
     let direction;
-    if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') direction = -1;
-    else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') direction = 1;
+    if (event.key === 'ArrowUp' || event.key === 'ArrowLeft' || event.key === 'k') direction = -1;
+    else if (event.key === 'ArrowDown' || event.key === 'ArrowRight' || event.key === 'j') direction = 1;
     else return;
     event.preventDefault();
     const entries = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]'));
