@@ -1,11 +1,12 @@
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
+use sha1::{Digest, Sha1};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
@@ -14,7 +15,11 @@ use syntect::util::LinesWithEndings;
 use tungstenite::handshake::derive_accept_key;
 
 mod collaboration;
+mod image_cache;
 mod review;
+mod thumbnails;
+
+use image_cache::{hex_digest, ImageCache};
 
 use collaboration::CollaborationHub;
 use review::{read_review, ReviewAction, ReviewHub};
@@ -40,12 +45,15 @@ struct PortConfig {
     fallback_to_random: bool,
     pid_file: Option<PathBuf>,
     web: bool,
+    cache_dir: Option<PathBuf>,
+    serve_dir: PathBuf,
 }
 
 #[derive(Default)]
 struct RequestHeaders {
     content_length: usize,
     accept: String,
+    if_none_match: String,
     fetch_dest: String,
     connection: String,
     upgrade: String,
@@ -63,13 +71,26 @@ fn main() {
         }
     };
 
-    let root = match env::current_dir().and_then(fs::canonicalize) {
-        Ok(root) => root,
+    let root = match fs::canonicalize(&port_config.serve_dir) {
+        Ok(root) if root.is_dir() => root,
+        Ok(_) => {
+            eprintln!("托管路径不是目录: {}", port_config.serve_dir.display());
+            std::process::exit(1);
+        }
         Err(error) => {
-            eprintln!("无法读取当前目录: {error}");
+            eprintln!(
+                "无法读取托管目录 {}: {error}",
+                port_config.serve_dir.display()
+            );
             std::process::exit(1);
         }
     };
+    let image_cache = port_config.cache_dir.as_deref().map(|path| {
+        ImageCache::new(path).unwrap_or_else(|error| {
+            eprintln!("无法创建图片缓存目录 {}: {error}", path.display());
+            std::process::exit(1);
+        })
+    });
     let listener = match bind_listener(&port_config) {
         Ok(listener) => listener,
         Err(error) => {
@@ -94,13 +115,19 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let image_cache = image_cache.clone();
                 let root = root.clone();
                 let collaboration = collaboration.clone();
                 let reviews = reviews.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) =
-                        handle_connection(stream, &root, &collaboration, &reviews, port_config.web)
-                    {
+                    if let Err(error) = handle_connection(
+                        stream,
+                        &root,
+                        &collaboration,
+                        &reviews,
+                        port_config.web,
+                        image_cache.as_ref(),
+                    ) {
                         eprintln!("请求处理失败: {error}");
                     }
                 });
@@ -118,6 +145,8 @@ where
     let mut fallback_to_random = true;
     let mut pid_file = None;
     let mut web = false;
+    let mut cache_dir = None;
+    let mut serve_dir = PathBuf::from(".");
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--port" => {
@@ -139,6 +168,16 @@ where
                 }
                 pid_file = Some(PathBuf::from(value));
             }
+            "-cache" | "--cache" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} 后需要缓存根目录"))?;
+                cache_dir = Some(PathBuf::from(value));
+            }
+            "-dir" | "--dir" => {
+                let value = args.next().ok_or_else(|| format!("{arg} 后需要托管目录"))?;
+                serve_dir = PathBuf::from(value);
+            }
             "--web" => web = true,
             "-h" | "--help" => {
                 println!("{}", usage());
@@ -152,6 +191,8 @@ where
         fallback_to_random,
         pid_file,
         web,
+        cache_dir,
+        serve_dir,
     }))
 }
 
@@ -165,7 +206,7 @@ fn bind_listener(config: &PortConfig) -> io::Result<TcpListener> {
 }
 
 fn usage() -> &'static str {
-    "用法: http [-p PORT] [-pid FILE] [--web]\n\n选项:\n  -p, --port PORT  指定监听端口（默认 8080）\n  -pid, --pid FILE 将启动进程 PID 写入指定文件\n  --web            以原始静态网站服务器模式运行\n  -h, --help       显示帮助"
+    "用法: http [-p PORT] [-pid FILE] [-cache DIR] [-dir DIR] [--web]\n\n选项:\n  -p, --port PORT    指定监听端口（默认 8080）\n  -pid, --pid FILE   将启动进程 PID 写入指定文件\n  -cache, --cache DIR 指定缓存根目录（缩略图存入 DIR/thumbnails）\n  -dir, --dir DIR    指定托管目录（默认当前目录）\n  --web             以原始静态网站服务器模式运行\n  -h, --help         显示帮助"
 }
 
 fn write_pid_file(path: &Path) -> io::Result<()> {
@@ -178,6 +219,7 @@ fn handle_connection(
     collaboration: &CollaborationHub,
     reviews: &ReviewHub,
     web: bool,
+    image_cache: Option<&ImageCache>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -498,6 +540,15 @@ fn handle_connection(
 
     // Image previews load the original asset through this internal URL so SVG
     // markup is never injected into the viewer document.
+    if asset_mode && is_image_file(&canonical) {
+        return send_image_asset(
+            &mut stream,
+            &canonical,
+            head_only,
+            image_cache.is_some(),
+            &headers.if_none_match,
+        );
+    }
     if asset_mode {
         return send_file(
             &mut stream,
@@ -516,7 +567,15 @@ fn handle_connection(
         } else {
             THUMBNAIL_MAX_EDGE
         };
-        return send_image_thumbnail(&mut stream, &canonical, metadata.len(), max_edge, head_only);
+        return send_image_thumbnail(
+            &mut stream,
+            &canonical,
+            metadata.len(),
+            max_edge,
+            head_only,
+            image_cache,
+            &headers.if_none_match,
+        );
     }
 
     if raw_mode {
@@ -709,6 +768,68 @@ fn send_file(
     Ok(())
 }
 
+fn send_image_headers(
+    stream: &mut TcpStream,
+    length: u64,
+    content_type: &str,
+    etag: Option<&str>,
+    if_none_match: &str,
+) -> io::Result<bool> {
+    if let Some(etag) = etag {
+        let unchanged = if_none_match.split(',').any(|value| {
+            let value = value.trim();
+            value == "*" || value.strip_prefix("W/").unwrap_or(value) == etag
+        });
+        if unchanged {
+            write!(stream, "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+            return Ok(false);
+        }
+    }
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nContent-Type: {content_type}\r\nConnection: close\r\n")?;
+    if let Some(etag) = etag {
+        write!(stream, "ETag: {etag}\r\nCache-Control: no-cache\r\n\r\n")?;
+    } else {
+        write!(stream, "Cache-Control: no-store\r\n\r\n")?;
+    }
+    Ok(true)
+}
+
+fn send_image_asset(
+    stream: &mut TcpStream,
+    path: &Path,
+    head_only: bool,
+    cache_enabled: bool,
+    if_none_match: &str,
+) -> io::Result<()> {
+    let mut file = File::open(path)?;
+    let etag = if cache_enabled {
+        let mut digest = Sha1::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        file.rewind()?;
+        Some(format!("\"{}\"", hex_digest(&digest.finalize())))
+    } else {
+        None
+    };
+    let modified = send_image_headers(
+        stream,
+        file.metadata()?.len(),
+        mime_type(path),
+        etag.as_deref(),
+        if_none_match,
+    )?;
+    if modified && !head_only {
+        io::copy(&mut file, stream)?;
+    }
+    Ok(())
+}
+
 fn read_request_headers<R: BufRead>(reader: &mut R) -> io::Result<RequestHeaders> {
     let mut headers = RequestHeaders::default();
     let mut total = 0;
@@ -730,6 +851,8 @@ fn read_request_headers<R: BufRead>(reader: &mut R) -> io::Result<RequestHeaders
                 headers.content_length = value.trim().parse().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid content-length")
                 })?;
+            } else if name.eq_ignore_ascii_case("if-none-match") {
+                headers.if_none_match = value.trim().to_owned();
             } else if name.eq_ignore_ascii_case("accept") {
                 headers.accept = value.trim().to_ascii_lowercase();
             } else if name.eq_ignore_ascii_case("sec-fetch-dest") {
@@ -963,10 +1086,10 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
         };
         let glyph = match (&thumb, &gallery_thumb) {
             (Some(src), Some(gallery_src)) => format!(
-                "<span class=\"glyph\" aria-hidden=\"true\"><img src=\"{src}\" data-list-src=\"{src}\" data-gallery-src=\"{gallery_src}\" alt=\"\" loading=\"lazy\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
+                "<span class=\"glyph\" aria-hidden=\"true\"><img data-list-src=\"{src}\" data-gallery-src=\"{gallery_src}\" alt=\"\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
             ),
             (Some(src), None) => format!(
-                "<span class=\"glyph\" aria-hidden=\"true\"><img src=\"{src}\" alt=\"\" loading=\"lazy\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
+                "<span class=\"glyph\" aria-hidden=\"true\"><img data-list-src=\"{src}\" alt=\"\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
             ),
             (None, _) => "<span class=\"glyph\" aria-hidden=\"true\"></span>".to_string(),
         };
@@ -1075,6 +1198,8 @@ fn send_image_thumbnail(
     size: u64,
     max_edge: u32,
     head_only: bool,
+    cache: Option<&ImageCache>,
+    if_none_match: &str,
 ) -> io::Result<()> {
     if !is_raster_image(path) {
         return send_text(
@@ -1094,8 +1219,24 @@ fn send_image_thumbnail(
             head_only,
         );
     }
-    match render_image_thumbnail(path, max_edge) {
-        Ok((bytes, content_type)) => send_content(stream, &bytes, content_type, head_only),
+    let source = fs::read(path)?;
+    let rendered = thumbnails::thumbnail(path, &source, max_edge, cache);
+    match rendered {
+        Ok(thumbnail) => {
+            let (bytes, content_type) = thumbnail.as_ref();
+            let etag = cache.map(|_| format!("\"{}\"", hex_digest(&Sha1::digest(bytes))));
+            let modified = send_image_headers(
+                stream,
+                bytes.len() as u64,
+                content_type,
+                etag.as_deref(),
+                if_none_match,
+            )?;
+            if modified && !head_only {
+                stream.write_all(bytes)?;
+            }
+            Ok(())
+        }
         Err(_) => send_text(
             stream,
             415,
@@ -1106,8 +1247,8 @@ fn send_image_thumbnail(
     }
 }
 
-fn render_image_thumbnail(path: &Path, max_edge: u32) -> io::Result<(Vec<u8>, &'static str)> {
-    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+fn render_image_thumbnail(source: &[u8], max_edge: u32) -> io::Result<(Vec<u8>, &'static str)> {
+    let mut reader = image::ImageReader::new(Cursor::new(source)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8_192);
     limits.max_image_height = Some(8_192);
@@ -1880,7 +2021,7 @@ const DIRECTORY_JS: &str = r#"
 const galleryToggle = document.querySelector('#gallery-toggle');
 if (galleryToggle) {
   const listing = document.querySelector('.listing');
-  const thumbnails = listing.querySelectorAll('img[data-gallery-src]');
+  const thumbnails = listing.querySelectorAll('img[data-list-src]');
   const lightbox = document.querySelector('#image-lightbox');
   const lightboxImage = lightbox.querySelector('img');
   const lightboxCaption = lightbox.querySelector('figcaption');
@@ -1893,6 +2034,63 @@ if (galleryToggle) {
   let previewTrigger = null;
   let deleteTimer = null;
   let deleting = false;
+
+  const visibleThumbnails = new Set();
+  const loadingThumbnails = new Set();
+  const loadedSources = new WeakMap();
+  let thumbnailFrame = null;
+
+  const scheduleThumbnails = () => {
+    if (thumbnailFrame !== null) return;
+    thumbnailFrame = requestAnimationFrame(loadVisibleThumbnails);
+  };
+
+  const thumbnailObserver = new IntersectionObserver(entries => {
+    entries.forEach(({target, isIntersecting}) => {
+      if (isIntersecting) visibleThumbnails.add(target);
+      else visibleThumbnails.delete(target);
+    });
+    scheduleThumbnails();
+  });
+
+  function loadVisibleThumbnails() {
+    thumbnailFrame = null;
+    const gallery = listing.classList.contains('gallery');
+    const candidates = [];
+    visibleThumbnails.forEach(image => {
+      if (!image.isConnected) {
+        visibleThumbnails.delete(image);
+        thumbnailObserver.unobserve(image);
+        return;
+      }
+      const source = gallery ? image.dataset.gallerySrc : image.dataset.listSrc;
+      if (!source || loadingThumbnails.has(image) || loadedSources.get(image) === source) return;
+      const rect = image.getBoundingClientRect();
+      if (rect.bottom <= 0 || rect.top >= innerHeight || rect.right <= 0 || rect.left >= innerWidth) return;
+      candidates.push({image, source, distance: Math.abs((rect.top + rect.bottom) / 2 - innerHeight / 2)});
+    });
+    candidates.sort((left, right) => left.distance - right.distance);
+    for (const {image, source} of candidates) {
+      if (loadingThumbnails.size >= 8) break;
+      loadingThumbnails.add(image);
+      const complete = event => {
+        image.removeEventListener('load', complete);
+        image.removeEventListener('error', complete);
+        loadingThumbnails.delete(image);
+        if (event.type === 'load') loadedSources.set(image, source);
+        else {
+          visibleThumbnails.delete(image);
+          thumbnailObserver.unobserve(image);
+        }
+        scheduleThumbnails();
+      };
+      image.addEventListener('load', complete);
+      image.addEventListener('error', complete);
+      image.src = source;
+    }
+  }
+
+  thumbnails.forEach(image => thumbnailObserver.observe(image));
 
   const clearDeleteTimer = () => {
     clearTimeout(deleteTimer);
@@ -1912,10 +2110,7 @@ if (galleryToggle) {
     galleryToggle.innerHTML = enabled
       ? '<span aria-hidden="true">☷</span> 列表'
       : '<span aria-hidden="true">▦</span> Gallery';
-    thumbnails.forEach(image => {
-      const source = enabled ? image.dataset.gallerySrc : image.dataset.listSrc;
-      if (source && image.getAttribute('src') !== source) image.setAttribute('src', source);
-    });
+    scheduleThumbnails();
     listing.querySelectorAll('.entry.image[data-gallery-href]').forEach(entry => {
       entry.setAttribute('href', enabled ? entry.dataset.galleryHref : entry.dataset.listHref);
     });
@@ -2086,6 +2281,7 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .entry.image .glyph { width:2.55rem; height:2.55rem; overflow:hidden; border:1px solid var(--line); border-radius:.55rem; background-color:var(--surface); background-image:linear-gradient(45deg,var(--grid) 25%,transparent 25%),linear-gradient(-45deg,var(--grid) 25%,transparent 25%),linear-gradient(45deg,transparent 75%,var(--grid) 75%),linear-gradient(-45deg,transparent 75%,var(--grid) 75%); background-position:0 0,0 5px,5px -5px,-5px 0; background-size:10px 10px; box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--line) 65%,transparent); opacity:1; }
 .entry.image .glyph::after { content:none; }
 .entry.image .glyph img { width:100%; height:100%; object-fit:cover; object-position:center; display:block; pointer-events:none; transition:transform .2s ease; }
+.entry.image .glyph img:not([src]) { visibility:hidden; }
 .entry.image:hover .glyph img { transform:scale(1.06); }
 .entry.image.vector .glyph img { object-fit:contain; padding:.2rem; }
 .listing.gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:1rem; padding:1rem; overflow:visible; }
@@ -3381,6 +3577,8 @@ mod tests {
                 fallback_to_random: true,
                 pid_file: None,
                 web: false,
+                cache_dir: None,
+                serve_dir: PathBuf::from("."),
             })
         );
         assert_eq!(
@@ -3390,6 +3588,8 @@ mod tests {
                 fallback_to_random: false,
                 pid_file: None,
                 web: false,
+                cache_dir: None,
+                serve_dir: PathBuf::from("."),
             })
         );
         assert_eq!(
@@ -3408,6 +3608,8 @@ mod tests {
                 fallback_to_random: false,
                 pid_file: Some(PathBuf::from("/tmp/http.pid")),
                 web: false,
+                cache_dir: None,
+                serve_dir: PathBuf::from("."),
             })
         );
         assert_eq!(
@@ -3417,6 +3619,8 @@ mod tests {
                 fallback_to_random: true,
                 pid_file: None,
                 web: true,
+                cache_dir: None,
+                serve_dir: PathBuf::from("."),
             })
         );
         assert!(parse_args(vec!["-pid".into()].into_iter()).is_err());
@@ -3431,6 +3635,8 @@ mod tests {
             fallback_to_random: true,
             pid_file: None,
             web: false,
+            cache_dir: None,
+            serve_dir: PathBuf::from("."),
         })
         .unwrap();
 
@@ -3446,6 +3652,8 @@ mod tests {
             fallback_to_random: false,
             pid_file: None,
             web: false,
+            cache_dir: None,
+            serve_dir: PathBuf::from("."),
         })
         .unwrap_err();
 
@@ -3466,6 +3674,141 @@ mod tests {
     }
 
     #[test]
+    fn parses_cache_and_serving_directories() {
+        for (cache_flag, dir_flag) in [("-cache", "-dir"), ("--cache", "--dir")] {
+            let config = parse_args(
+                vec![
+                    cache_flag.into(),
+                    "image cache".into(),
+                    dir_flag.into(),
+                    "my photos".into(),
+                ]
+                .into_iter(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(config.cache_dir, Some(PathBuf::from("image cache")));
+            assert_eq!(config.serve_dir, PathBuf::from("my photos"));
+            assert!(parse_args(vec![cache_flag.into()].into_iter()).is_err());
+            assert!(parse_args(vec![dir_flag.into()].into_iter()).is_err());
+        }
+    }
+
+    fn image_request(
+        root: &Path,
+        cache: Option<&ImageCache>,
+        method: &str,
+        mode: &str,
+        etag: &str,
+    ) -> (String, Vec<u8>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = root.to_owned();
+        let cache = cache.cloned();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(
+                stream,
+                &root,
+                &CollaborationHub::default(),
+                &ReviewHub::default(),
+                false,
+                cache.as_ref(),
+            )
+            .unwrap();
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        write!(stream, "{method} /photo.png?mode={mode} HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {etag}\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        server.join().unwrap();
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        (
+            String::from_utf8(response[..split].to_vec()).unwrap(),
+            response[split..].to_vec(),
+        )
+    }
+
+    #[test]
+    fn image_cache_revalidates_overwritten_and_recreated_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("photo.png");
+        let cache = ImageCache::new(&directory.path().join("cache")).unwrap();
+        let original_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let write_image = |color| {
+            let mut source = Cursor::new(Vec::new());
+            image::RgbImage::from_pixel(800, 200, image::Rgb(color))
+                .write_to(&mut source, image::ImageFormat::Png)
+                .unwrap();
+            // Keep size and mtime identical while changing the image content.
+            let mut source = source.into_inner();
+            source.resize(8192, 0);
+            fs::write(&path, source).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(original_time))
+                .unwrap();
+        };
+        for mode in ["thumb", "gallery-thumb", "asset"] {
+            write_image([240, 20, 30]);
+            let (headers, first) = image_request(directory.path(), Some(&cache), "GET", mode, "");
+            assert!(headers.starts_with("HTTP/1.1 200"));
+            assert!(headers.contains("Cache-Control: no-cache\r\n"));
+            let etag = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("ETag: "))
+                .unwrap();
+            let (headers, body) = image_request(directory.path(), Some(&cache), "GET", mode, etag);
+            assert!(headers.starts_with("HTTP/1.1 304"));
+            assert!(body.is_empty());
+
+            let (headers, body) = image_request(directory.path(), Some(&cache), "HEAD", mode, "");
+            assert!(headers.starts_with("HTTP/1.1 200"));
+            assert!(headers.contains(&format!("Content-Length: {}\r\n", first.len())));
+            assert!(body.is_empty());
+
+            write_image([20, 30, 240]);
+            let (headers, changed) =
+                image_request(directory.path(), Some(&cache), "GET", mode, etag);
+            assert!(headers.starts_with("HTTP/1.1 200"));
+            assert_ne!(first, changed);
+
+            fs::remove_file(&path).unwrap();
+            let (headers, _) = image_request(directory.path(), Some(&cache), "GET", mode, etag);
+            assert!(headers.starts_with("HTTP/1.1 404"));
+            write_image([20, 240, 30]);
+            let (headers, recreated) =
+                image_request(directory.path(), Some(&cache), "GET", mode, etag);
+            assert!(headers.starts_with("HTTP/1.1 200"));
+            assert_ne!(first, recreated);
+            assert_ne!(changed, recreated);
+            image::load_from_memory(&recreated).unwrap();
+        }
+    }
+
+    #[test]
+    fn image_requests_without_cache_always_return_current_content() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbImage::from_pixel(32, 32, image::Rgb([20, 40, 60]))
+            .save(directory.path().join("photo.png"))
+            .unwrap();
+        for mode in ["thumb", "gallery-thumb", "asset"] {
+            let (headers, body) = image_request(directory.path(), None, "GET", mode, "*");
+            assert!(headers.starts_with("HTTP/1.1 200"));
+            assert!(headers.contains("Cache-Control: no-store\r\n"));
+            image::load_from_memory(&body).unwrap();
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn web_mode_serves_index_and_files_without_special_rendering() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("index.html"), "<h1>home</h1>").unwrap();
@@ -3478,7 +3821,7 @@ mod tests {
             let reviews = ReviewHub::default();
             for _ in 0..3 {
                 let (stream, _) = listener.accept().unwrap();
-                handle_connection(stream, &root, &collaboration, &reviews, true).unwrap();
+                handle_connection(stream, &root, &collaboration, &reviews, true, None).unwrap();
             }
         });
 
@@ -3696,7 +4039,7 @@ mod tests {
         let reviews = ReviewHub::default();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle_connection(stream, &root, &hub, &reviews, false).unwrap();
+            handle_connection(stream, &root, &hub, &reviews, false, None).unwrap();
         });
 
         let (mut socket, response) =
@@ -3816,7 +4159,7 @@ mod tests {
             let reviews = ReviewHub::default();
             for _ in 0..3 {
                 let (stream, _) = listener.accept().unwrap();
-                handle_connection(stream, &root, &collaboration, &reviews, false).unwrap();
+                handle_connection(stream, &root, &collaboration, &reviews, false, None).unwrap();
             }
         });
         let request = |method: &str, target: &str| {
@@ -3873,7 +4216,7 @@ mod tests {
         assert!(page.contains("class=\"entry file\" href=\"/notes.md\""));
         assert!(!page.contains("notes.md?mode=thumb"));
         assert!(page.contains("class=\"entry folder\" href=\"/docs/\""));
-        assert!(page.contains("loading=\"lazy\""));
+        assert!(page.contains("data-list-src=\"/photo.png?mode=thumb\""));
         assert!(
             page.contains(".entry.image .glyph img { width:100%; height:100%; object-fit:cover;")
         );
@@ -3926,7 +4269,8 @@ mod tests {
                 let collaboration = collaboration.clone();
                 let reviews = reviews.clone();
                 connections.push(std::thread::spawn(move || {
-                    handle_connection(stream, &root, &collaboration, &reviews, false).unwrap();
+                    handle_connection(stream, &root, &collaboration, &reviews, false, None)
+                        .unwrap();
                 }));
             }
             for connection in connections {
@@ -4041,13 +4385,15 @@ mod tests {
             .save(&path)
             .unwrap();
 
-        let (bytes, content_type) = render_image_thumbnail(&path, THUMBNAIL_MAX_EDGE).unwrap();
+        let (bytes, content_type) =
+            render_image_thumbnail(&fs::read(&path).unwrap(), THUMBNAIL_MAX_EDGE).unwrap();
         assert_eq!(content_type, "image/jpeg");
         let thumb = image::load_from_memory(&bytes).unwrap();
         assert_eq!(thumb.width(), 128);
         assert_eq!(thumb.height(), 32);
 
-        let (bytes, _) = render_image_thumbnail(&path, GALLERY_THUMBNAIL_MAX_EDGE).unwrap();
+        let (bytes, _) =
+            render_image_thumbnail(&fs::read(&path).unwrap(), GALLERY_THUMBNAIL_MAX_EDGE).unwrap();
         let gallery_thumb = image::load_from_memory(&bytes).unwrap();
         assert_eq!(gallery_thumb.width(), 512);
         assert_eq!(gallery_thumb.height(), 128);
@@ -4057,7 +4403,7 @@ mod tests {
             .save(&transparent)
             .unwrap();
         let (bytes, content_type) =
-            render_image_thumbnail(&transparent, THUMBNAIL_MAX_EDGE).unwrap();
+            render_image_thumbnail(&fs::read(&transparent).unwrap(), THUMBNAIL_MAX_EDGE).unwrap();
         assert_eq!(content_type, "image/png");
         assert!(image::load_from_memory(&bytes).unwrap().color().has_alpha());
     }

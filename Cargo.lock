@@ -347,6 +347,7 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
+ "sha1",
  "syntect",
  "tempfile",
  "tungstenite",
