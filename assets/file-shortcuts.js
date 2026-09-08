@@ -1,4 +1,43 @@
 (() => {
+  document.querySelector('#history-back')?.addEventListener('click', () => history.back());
+
+  const breadcrumbs = document.querySelector('.file-breadcrumbs');
+  if (breadcrumbs) {
+    const links = Array.from(breadcrumbs.querySelectorAll('a'));
+    links.forEach(link => { link.title = link.textContent; });
+    const middle = links.slice(1, -1);
+    const overflow = document.createElement('span');
+    overflow.className = 'breadcrumb-overflow';
+    overflow.hidden = true;
+    overflow.innerHTML = '<span aria-hidden="true">/</span><details><summary aria-label="展开中间路径" title="展开中间路径">…</summary><div class="breadcrumb-menu"></div></details>';
+    const menu = overflow.querySelector('.breadcrumb-menu');
+    middle.forEach(link => menu.append(link.cloneNode(true)));
+    const separators = middle.map(link => link.previousElementSibling);
+    links[0].after(overflow);
+    const details = overflow.querySelector('details');
+    const fitBreadcrumbs = () => {
+      details.open = false;
+      overflow.hidden = true;
+      middle.forEach((link, index) => { link.hidden = separators[index].hidden = false; });
+      breadcrumbs.classList.add('measuring');
+      const collapsed = middle.length > 0 && breadcrumbs.scrollWidth > breadcrumbs.clientWidth;
+      middle.forEach((link, index) => { link.hidden = separators[index].hidden = collapsed; });
+      overflow.hidden = !collapsed;
+      breadcrumbs.classList.remove('measuring');
+    };
+    new ResizeObserver(fitBreadcrumbs).observe(breadcrumbs);
+    fitBreadcrumbs();
+    document.addEventListener('click', event => {
+      if (!overflow.contains(event.target)) details.open = false;
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && details.open) {
+        details.open = false;
+        details.querySelector('summary').focus();
+      }
+    });
+  }
+
   let pendingPath = null;
   let keyTimer;
   let toastTimer;
@@ -46,6 +85,12 @@
     }
     notify(copied ? `复制文件路径 ${path}` : '复制失败，请检查浏览器剪贴板权限');
   };
+
+  const openReviewFile = document.querySelector('#open-review-file');
+  if (openReviewFile) openReviewFile.href = `${location.pathname}.review.json`;
+  document.querySelector('#copy-review-path')?.addEventListener('click', () => {
+    copyPath(`${document.body.dataset.filePath}.review.json`);
+  });
 
   document.addEventListener('keydown', event => {
     if (document.querySelector('#editor:not([hidden])')) {
