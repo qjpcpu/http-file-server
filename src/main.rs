@@ -189,7 +189,7 @@ fn handle_connection(
     let head_only = method == "HEAD";
 
     if (web && !matches!(method, "GET" | "HEAD"))
-        || (!web && !matches!(method, "GET" | "HEAD" | "POST" | "PUT"))
+        || (!web && !matches!(method, "GET" | "HEAD" | "POST" | "PUT" | "DELETE"))
     {
         return send_text(
             &mut stream,
@@ -198,7 +198,7 @@ fn handle_connection(
             if web {
                 "仅支持 GET 和 HEAD\n"
             } else {
-                "仅支持 GET、HEAD、POST 和 PUT\n"
+                "仅支持 GET、HEAD、POST、PUT 和 DELETE\n"
             },
             head_only,
         );
@@ -285,6 +285,27 @@ fn handle_connection(
     };
 
     let metadata = fs::metadata(&canonical)?;
+    if method == "DELETE" {
+        if !metadata.is_file() || !is_image_file(&canonical) {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "仅支持删除图片文件\n",
+                false,
+            );
+        }
+        return match fs::remove_file(root.join(&relative)) {
+            Ok(()) => send_empty(&mut stream, 204, "No Content"),
+            Err(_) => send_text(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                "删除失败，请检查文件是否可写后重试。\n",
+                false,
+            ),
+        };
+    }
     if metadata.is_dir() {
         if !request_path.ends_with('/') {
             let location = if query.is_empty() {
@@ -971,7 +992,7 @@ fn render_directory_page(root: &Path, directory: &Path) -> io::Result<String> {
         ""
     };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}</header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><figure><img alt=\"\"><figcaption></figcaption></figure></div>\n<script>{DIRECTORY_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}</header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><figure><img alt=\"\"><figcaption></figcaption></figure>{GALLERY_DELETE_DIALOG}</div>\n<script>{DIRECTORY_JS}</script>\n</body>\n</html>"
     ))
 }
 
@@ -1845,6 +1866,16 @@ window.onDrawioViewerLoad = () => {
 };
 "#;
 
+const GALLERY_DELETE_DIALOG: &str = r#"
+<dialog class="delete-dialog" id="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
+  <h2 id="delete-title">删除这张图片？</h2>
+  <p class="delete-name" id="delete-name"></p>
+  <p id="delete-description">图片将从磁盘中删除，此操作无法撤销。</p>
+  <p class="delete-error" id="delete-error" role="alert" hidden></p>
+  <div class="delete-actions"><button id="delete-cancel" type="button" autofocus>取消</button><button id="delete-confirm" type="button">删除图片</button></div>
+</dialog>
+"#;
+
 const DIRECTORY_JS: &str = r#"
 const galleryToggle = document.querySelector('#gallery-toggle');
 if (galleryToggle) {
@@ -1854,7 +1885,25 @@ if (galleryToggle) {
   const lightboxImage = lightbox.querySelector('img');
   const lightboxCaption = lightbox.querySelector('figcaption');
   const lightboxClose = lightbox.querySelector('.lightbox-close');
+  const deleteDialog = document.querySelector('#delete-dialog');
+  const deleteName = deleteDialog.querySelector('#delete-name');
+  const deleteError = deleteDialog.querySelector('#delete-error');
+  const deleteCancel = deleteDialog.querySelector('#delete-cancel');
+  const deleteConfirm = deleteDialog.querySelector('#delete-confirm');
   let previewTrigger = null;
+  let deleteTimer = null;
+  let deleting = false;
+
+  const clearDeleteTimer = () => {
+    clearTimeout(deleteTimer);
+    deleteTimer = null;
+  };
+
+  const showDeleteDialog = () => {
+    deleteName.textContent = previewTrigger.querySelector('.entry-name').textContent;
+    deleteError.hidden = true;
+    deleteDialog.showModal();
+  };
 
   const setGallery = (enabled, updateUrl = true) => {
     listing.classList.toggle('gallery', enabled);
@@ -1879,15 +1928,18 @@ if (galleryToggle) {
   };
 
   const closeLightbox = () => {
-    if (lightbox.hidden) return;
+    if (lightbox.hidden || deleting) return;
+    clearDeleteTimer();
+    if (deleteDialog.open) deleteDialog.close();
     lightbox.hidden = true;
     lightboxImage.removeAttribute('src');
     document.body.classList.remove('lightbox-open');
-    if (previewTrigger) previewTrigger.focus();
+    (previewTrigger || galleryToggle).focus();
     previewTrigger = null;
   };
 
   const openLightbox = entry => {
+    clearDeleteTimer();
     previewTrigger = entry;
     const name = entry.querySelector('.entry-name').textContent;
     lightboxImage.src = entry.dataset.previewSrc;
@@ -1897,6 +1949,53 @@ if (galleryToggle) {
     document.body.classList.add('lightbox-open');
     lightboxClose.focus();
   };
+
+  const deleteImage = async () => {
+    if (deleting || !previewTrigger) return;
+    clearDeleteTimer();
+    const entry = previewTrigger;
+    deleting = true;
+    deleteConfirm.disabled = deleteCancel.disabled = lightboxClose.disabled = true;
+    deleteConfirm.textContent = '正在删除…';
+    deleteError.hidden = true;
+    try {
+      const response = await fetch(entry.dataset.listHref, {method: 'DELETE'});
+      if (!response.ok) throw new Error('删除失败，请检查文件是否存在且可写后重试。');
+      const entries = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]'));
+      const index = entries.indexOf(entry);
+      const nextEntry = entries[index + 1] || entries[index - 1];
+      if (deleteDialog.open) deleteDialog.close();
+      entry.remove();
+      const directoryCount = listing.querySelectorAll('.entry.folder').length;
+      const fileCount = listing.querySelectorAll('.entry.file').length;
+      document.querySelector('.summary').textContent = `${directoryCount} 个目录 · ${fileCount} 个文件`;
+      deleting = false;
+      if (nextEntry) openLightbox(nextEntry);
+      else {
+        previewTrigger = null;
+        closeLightbox();
+      }
+      if (!directoryCount && !fileCount) {
+        listing.innerHTML = '<div class="empty"><span>∅</span><p>这个目录是空的</p></div>';
+      }
+    } catch (error) {
+      if (!deleteDialog.open) showDeleteDialog();
+      deleteError.textContent = error.message;
+      deleteError.hidden = false;
+    } finally {
+      deleting = false;
+      deleteConfirm.disabled = deleteCancel.disabled = lightboxClose.disabled = false;
+      deleteConfirm.textContent = '删除图片';
+      if (deleteDialog.open) deleteCancel.focus();
+      else if (!lightbox.hidden) lightboxClose.focus();
+    }
+  };
+
+  deleteConfirm.addEventListener('click', deleteImage);
+  deleteCancel.addEventListener('click', () => deleteDialog.close());
+  deleteDialog.addEventListener('cancel', event => {
+    if (deleting) event.preventDefault();
+  });
 
   listing.addEventListener('click', event => {
     const imageArea = event.target.closest('.entry.image .glyph');
@@ -1912,8 +2011,24 @@ if (galleryToggle) {
     if (event.target === lightbox) closeLightbox();
   });
   document.addEventListener('keydown', event => {
+    if (deleting || deleteDialog.open) return;
     if (event.key === 'Escape') closeLightbox();
     if (lightbox.hidden) return;
+    if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) {
+      clearDeleteTimer();
+      return;
+    }
+    if (event.key === 'd') {
+      event.preventDefault();
+      if (event.repeat) return;
+      if (deleteTimer !== null) deleteImage();
+      else deleteTimer = setTimeout(() => {
+        deleteTimer = null;
+        showDeleteDialog();
+      }, 350);
+      return;
+    }
+    clearDeleteTimer();
     let direction;
     if (event.key === 'ArrowUp' || event.key === 'ArrowLeft' || event.key === 'k') direction = -1;
     else if (event.key === 'ArrowDown' || event.key === 'ArrowRight' || event.key === 'j') direction = 1;
@@ -1925,6 +2040,7 @@ if (galleryToggle) {
   });
 
   galleryToggle.addEventListener('click', () => {
+    if (deleting) return;
     const enabled = !listing.classList.contains('gallery');
     if (!enabled) closeLightbox();
     setGallery(enabled);
@@ -1984,6 +2100,19 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .gallery .arrow { display:none; }
 .gallery .folder .glyph,.gallery .file:not(.image) .glyph { transform:scale(1.35); }
 .gallery .entry.image .glyph { cursor:zoom-in; }
+.delete-dialog { width:min(calc(100% - 2rem),26rem); padding:1.5rem; border:0; border-radius:1rem; color:var(--ink); background:var(--surface); box-shadow:0 24px 80px rgba(0,0,0,.35); }
+.delete-dialog::backdrop { background:rgba(10,12,20,.6); }
+.delete-dialog h2 { margin:0 0 1rem; font-size:1.3rem; }
+.delete-dialog p { margin:.75rem 0; line-height:1.6; }
+.delete-name { font-weight:650; overflow-wrap:anywhere; }
+.delete-dialog #delete-description { font-size:.875rem; }
+.delete-error { color:light-dark(#b42336,#ff9ba9); font-size:.875rem; }
+.delete-actions { display:flex; justify-content:flex-end; gap:.75rem; margin-top:1.5rem; }
+.delete-actions button { min-height:2.75rem; padding:.65rem 1rem; border:1px solid var(--line); border-radius:.6rem; color:var(--ink); background:var(--surface); font-family:inherit; font-size:.875rem; font-weight:600; line-height:1.2; cursor:pointer; }
+.delete-actions button:hover { background:var(--accent-soft); }
+.delete-actions #delete-confirm { border-color:transparent; color:#fff; background:#b42336; }
+.delete-actions #delete-confirm:hover { background:#941b2b; }
+.delete-actions button:disabled { opacity:.6; cursor:wait; }
 .image-lightbox { position:fixed; z-index:20; inset:0; display:grid; place-items:center; padding:clamp(1rem,4vw,3rem); background:rgba(10,12,20,.82); backdrop-filter:blur(10px); }
 .image-lightbox figure { display:grid; gap:.75rem; max-width:100%; max-height:100%; margin:0; padding:.75rem; overflow:auto; border:1px solid rgba(255,255,255,.2); border-radius:1rem; color:#fff; background:rgba(20,22,31,.96); box-shadow:0 30px 90px rgba(0,0,0,.45); }
 .image-lightbox img { display:block; max-width:min(90vw,1400px); max-height:calc(90vh - 4rem); max-height:calc(90dvh - 4rem); margin:auto; object-fit:contain; }
@@ -3670,6 +3799,46 @@ mod tests {
         assert!(page.contains("body.wrap .line::before { position:absolute;"));
         assert!(page.contains("</span><span class=\"line\">"));
         assert!(!page.contains("</span>\n<span class=\"line\">"));
+    }
+
+    #[test]
+    fn deletes_gallery_images_from_disk_and_directory_listing() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbImage::new(2, 2)
+            .save(directory.path().join("my photo.png"))
+            .unwrap();
+        fs::write(directory.path().join("icon.svg"), "<svg></svg>").unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let collaboration = CollaborationHub::default();
+            let reviews = ReviewHub::default();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection(stream, &root, &collaboration, &reviews, false).unwrap();
+            }
+        });
+        let request = |method: &str, target: &str| {
+            let mut client = TcpStream::connect(address).unwrap();
+            write!(
+                client,
+                "{method} {target} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        assert!(request("DELETE", "/my%20photo.png").starts_with("HTTP/1.1 204 No Content"));
+        assert!(!directory.path().join("my photo.png").exists());
+        assert!(request("DELETE", "/icon.svg").starts_with("HTTP/1.1 204 No Content"));
+        assert!(!directory.path().join("icon.svg").exists());
+        let listing = request("GET", "/?view=gallery");
+        assert!(listing.contains("0 个目录 · 0 个文件"));
+        assert!(listing.contains("这个目录是空的"));
+        server.join().unwrap();
     }
 
     #[test]
