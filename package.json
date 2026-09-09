@@ -1,0 +1,11 @@
+{
+  "name": "http-file-server-browser-tests",
+  "private": true,
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:install": "playwright install chromium webkit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

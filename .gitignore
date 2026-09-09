@@ -1,3 +1,8 @@
 /target
 /install.sh
 /pid
+/node_modules
+/test-results
+/playwright-report
+/tests/browser/fixtures/.gallery-comments.json
+/tests/browser/fixtures/*.review.json

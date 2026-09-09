@@ -1,6 +1,7 @@
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -15,15 +16,14 @@ use syntect::util::LinesWithEndings;
 use tungstenite::handshake::derive_accept_key;
 
 mod collaboration;
-mod deletion_marks;
-mod favourites;
+mod gallery_comments;
 mod image_cache;
 mod review;
+mod state;
 mod thumbnails;
 
-use deletion_marks::DeletionMarks;
-use favourites::Favourites;
 use image_cache::{hex_digest, ImageCache};
+use state::StateStore;
 
 use collaboration::CollaborationHub;
 use review::{read_review, ReviewAction, ReviewHub};
@@ -32,9 +32,10 @@ const DEFAULT_PORT: u16 = 8080;
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 const MAX_TEXT_VIEWER_FILE: u64 = 4 * 1024 * 1024;
 const MAX_DRAWIO_VIEWER_FILE: u64 = 16 * 1024 * 1024;
-const MAX_THUMBNAIL_SOURCE: u64 = 16 * 1024 * 1024;
+const MAX_THUMBNAIL_SOURCE: u64 = 64 * 1024 * 1024;
 const THUMBNAIL_MAX_EDGE: u32 = 128;
 const GALLERY_THUMBNAIL_MAX_EDGE: u32 = 512;
+const GALLERY_PREVIEW_MAX_EDGE: u32 = 2560;
 const DRAWIO_VIEWER_PATH: &str = "/__http_file_server/drawio-viewer-31.3.1.js";
 const DRAWIO_VIEWER_JS: &[u8] = include_bytes!("../assets/drawio-viewer-static-31.3.1.min.js");
 const MERMAID_PATH: &str = "/__http_file_server/mermaid-11.17.2.min.js";
@@ -95,15 +96,13 @@ fn main() {
             std::process::exit(1);
         })
     });
-    let favourites = Favourites::new(port_config.cache_dir.as_deref()).unwrap_or_else(|error| {
-        eprintln!("无法创建点赞索引目录: {error}");
+    if let Some(cache) = &image_cache {
+        cache.start_maintenance();
+    }
+    let state = StateStore::new(port_config.cache_dir.as_deref()).unwrap_or_else(|error| {
+        eprintln!("无法打开状态数据库: {error}");
         std::process::exit(1);
     });
-    let deletion_marks =
-        DeletionMarks::new(port_config.cache_dir.as_deref()).unwrap_or_else(|error| {
-            eprintln!("无法创建待删除索引目录: {error}");
-            std::process::exit(1);
-        });
     let listener = match bind_listener(&port_config) {
         Ok(listener) => listener,
         Err(error) => {
@@ -129,8 +128,7 @@ fn main() {
         match stream {
             Ok(stream) => {
                 let image_cache = image_cache.clone();
-                let favourites = favourites.clone();
-                let deletion_marks = deletion_marks.clone();
+                let state = state.clone();
                 let root = root.clone();
                 let collaboration = collaboration.clone();
                 let reviews = reviews.clone();
@@ -142,8 +140,7 @@ fn main() {
                         &reviews,
                         port_config.web,
                         image_cache.as_ref(),
-                        &favourites,
-                        &deletion_marks,
+                        &state,
                     ) {
                         eprintln!("请求处理失败: {error}");
                     }
@@ -237,8 +234,7 @@ fn handle_connection(
     reviews: &ReviewHub,
     web: bool,
     image_cache: Option<&ImageCache>,
-    favourites: &Favourites,
-    deletion_marks: &DeletionMarks,
+    state: &StateStore,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -316,15 +312,18 @@ fn handle_connection(
         return send_content(&mut stream, icon.as_bytes(), "image/svg+xml", head_only);
     }
     let mode = query_parameter(query, "mode");
+    let requested_image_version = query_parameter(query, "v");
     let raw_mode = mode.as_deref() == Some("raw");
     let preview_mode = mode.as_deref() == Some("preview");
     let asset_mode = mode.as_deref() == Some("asset");
     let thumb_mode = mode.as_deref() == Some("thumb");
     let gallery_thumb_mode = mode.as_deref() == Some("gallery-thumb");
+    let gallery_preview_mode = mode.as_deref() == Some("gallery-preview");
     let collaboration_mode = mode.as_deref() == Some("collab");
     let review_data_mode = mode.as_deref() == Some("review-data");
     let review_action_mode = mode.as_deref() == Some("review-action");
     let review_collaboration_mode = mode.as_deref() == Some("review-collab");
+    let gallery_comments_mode = mode.as_deref() == Some("gallery-comments");
     let decoded = match percent_decode(request_path) {
         Some(path) => path,
         None => return send_text(&mut stream, 400, "Bad Request", "无效的 URL\n", head_only),
@@ -345,11 +344,7 @@ fn handle_connection(
     };
 
     let metadata = fs::metadata(&canonical)?;
-    if let Some(destination) = match mode.as_deref() {
-        Some("move-favourites") => Some("favourites"),
-        Some("move-unpopular") => Some("unpopular"),
-        _ => None,
-    } {
+    if mode.as_deref() == Some("move-favourites") {
         if method != "POST" || !metadata.is_dir() {
             return send_text(
                 &mut stream,
@@ -359,7 +354,7 @@ fn handle_connection(
                 head_only,
             );
         }
-        return match move_directory_images(&canonical, favourites, deletion_marks, destination) {
+        return match move_favourite_images(&canonical, state) {
             Ok(result) => send_content(
                 &mut stream,
                 &serde_json::to_vec(&result)?,
@@ -386,7 +381,7 @@ fn handle_connection(
                 head_only,
             );
         }
-        return match favourites.set(&canonical, method == "PUT") {
+        return match state.set_favourite(&canonical, method == "PUT") {
             Ok(()) => send_empty(&mut stream, 204, "No Content"),
             Err(_) => send_text(
                 &mut stream,
@@ -408,7 +403,7 @@ fn handle_connection(
                 head_only,
             );
         }
-        return match deletion_marks.set(&canonical, method == "PUT") {
+        return match state.set_deletion_mark(&canonical, method == "PUT") {
             Ok(()) => send_empty(&mut stream, 204, "No Content"),
             Err(_) => send_text(
                 &mut stream,
@@ -429,7 +424,7 @@ fn handle_connection(
                 head_only,
             );
         }
-        return match delete_marked_images(&canonical, favourites, deletion_marks) {
+        return match delete_marked_images(&canonical, state) {
             Ok(result) => send_json(&mut stream, &result, false),
             Err(error) => send_text(
                 &mut stream,
@@ -450,7 +445,7 @@ fn handle_connection(
                 head_only,
             );
         }
-        return match clear_directory_deletion_marks(&canonical, deletion_marks) {
+        return match clear_directory_deletion_marks(&canonical, state) {
             Ok(result) => send_json(&mut stream, &result, false),
             Err(error) => send_text(
                 &mut stream,
@@ -472,7 +467,7 @@ fn handle_connection(
             );
         }
         return match fs::remove_file(root.join(&relative)) {
-            Ok(()) => match deletion_marks.set(&canonical, false) {
+            Ok(()) => match state.clear_image_state(&canonical) {
                 Ok(()) => send_empty(&mut stream, 204, "No Content"),
                 Err(_) => send_text(
                     &mut stream,
@@ -500,12 +495,66 @@ fn handle_connection(
             };
             return send_redirect(&mut stream, &location);
         }
-        let body = render_directory_page(root, &canonical, favourites, deletion_marks)?;
+        let body = render_directory_page(root, &canonical, state)?;
         return send_html(&mut stream, &body, head_only);
     }
     if !metadata.is_file() {
         let body = render_not_found_page(&decoded);
         return send_html_status(&mut stream, 404, "Not Found", &body, head_only);
+    }
+
+    if gallery_comments_mode {
+        if !is_image_file(&canonical) {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "仅支持图片评论\n",
+                head_only,
+            );
+        }
+        if matches!(method, "GET" | "HEAD") {
+            return match gallery_comments::read(&canonical) {
+                Ok(comments) => send_json(&mut stream, &comments, head_only),
+                Err(error) => send_text(
+                    &mut stream,
+                    500,
+                    "Internal Server Error",
+                    &format!("读取图片评论失败：{error}\n"),
+                    head_only,
+                ),
+            };
+        }
+        if method == "POST" {
+            let body = match read_request_body(&mut reader, headers.content_length) {
+                Ok(body) => body,
+                Err(error) => return send_text(&mut stream, 400, "Bad Request", &error, false),
+            };
+            let action = match serde_json::from_str::<gallery_comments::GalleryCommentAction>(&body)
+            {
+                Ok(action) => action,
+                Err(error) => {
+                    return send_text(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        &format!("无效的图片评论操作：{error}\n"),
+                        false,
+                    )
+                }
+            };
+            return match gallery_comments::apply(&canonical, action) {
+                Ok(comments) => send_json(&mut stream, &comments, false),
+                Err(error) => send_text(&mut stream, 409, "Conflict", &format!("{error}\n"), false),
+            };
+        }
+        return send_text(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "仅支持读取或更新图片评论\n",
+            head_only,
+        );
     }
 
     if review_collaboration_mode {
@@ -687,8 +736,10 @@ fn handle_connection(
         return send_image_asset(
             &mut stream,
             &canonical,
+            &metadata,
             head_only,
             image_cache.is_some(),
+            requested_image_version.as_deref(),
             &headers.if_none_match,
         );
     }
@@ -704,8 +755,10 @@ fn handle_connection(
 
     // Directory listings request a downscaled preview instead of decoding a
     // full-size photo into a 40px well.
-    if thumb_mode || gallery_thumb_mode {
-        let max_edge = if gallery_thumb_mode {
+    if thumb_mode || gallery_thumb_mode || gallery_preview_mode {
+        let max_edge = if gallery_preview_mode {
+            GALLERY_PREVIEW_MAX_EDGE
+        } else if gallery_thumb_mode {
             GALLERY_THUMBNAIL_MAX_EDGE
         } else {
             THUMBNAIL_MAX_EDGE
@@ -713,10 +766,11 @@ fn handle_connection(
         return send_image_thumbnail(
             &mut stream,
             &canonical,
-            metadata.len(),
+            &metadata,
             max_edge,
             head_only,
             image_cache,
+            requested_image_version.as_deref(),
             &headers.if_none_match,
         );
     }
@@ -917,22 +971,33 @@ fn send_image_headers(
     content_type: &str,
     etag: Option<&str>,
     if_none_match: &str,
+    immutable: bool,
 ) -> io::Result<bool> {
+    let cache_control = if immutable {
+        "private, max-age=31536000, immutable"
+    } else if etag.is_some() {
+        "no-cache"
+    } else {
+        "no-store"
+    };
     if let Some(etag) = etag {
         let unchanged = if_none_match.split(',').any(|value| {
             let value = value.trim();
             value == "*" || value.strip_prefix("W/").unwrap_or(value) == etag
         });
         if unchanged {
-            write!(stream, "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+            write!(stream, "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: {cache_control}\r\nConnection: close\r\n\r\n")?;
             return Ok(false);
         }
     }
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nContent-Type: {content_type}\r\nConnection: close\r\n")?;
     if let Some(etag) = etag {
-        write!(stream, "ETag: {etag}\r\nCache-Control: no-cache\r\n\r\n")?;
+        write!(
+            stream,
+            "ETag: {etag}\r\nCache-Control: {cache_control}\r\n\r\n"
+        )?;
     } else {
-        write!(stream, "Cache-Control: no-store\r\n\r\n")?;
+        write!(stream, "Cache-Control: {cache_control}\r\n\r\n")?;
     }
     Ok(true)
 }
@@ -940,34 +1005,25 @@ fn send_image_headers(
 fn send_image_asset(
     stream: &mut TcpStream,
     path: &Path,
+    metadata: &fs::Metadata,
     head_only: bool,
     cache_enabled: bool,
+    requested_version: Option<&str>,
     if_none_match: &str,
 ) -> io::Result<()> {
-    let mut file = File::open(path)?;
-    let etag = if cache_enabled {
-        let mut digest = Sha1::new();
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-        file.rewind()?;
-        Some(format!("\"{}\"", hex_digest(&digest.finalize())))
-    } else {
-        None
-    };
+    let version = file_version(metadata);
+    let etag = cache_enabled.then(|| format!("\"{version}\""));
+    let immutable = cache_enabled && requested_version == Some(version.as_str());
     let modified = send_image_headers(
         stream,
-        file.metadata()?.len(),
+        metadata.len(),
         mime_type(path),
         etag.as_deref(),
         if_none_match,
+        immutable,
     )?;
     if modified && !head_only {
+        let mut file = File::open(path)?;
         io::copy(&mut file, stream)?;
     }
     Ok(())
@@ -1176,6 +1232,7 @@ struct DirectoryEntry {
     path: PathBuf,
     is_dir: bool,
     size: u64,
+    image_version: Option<String>,
     favourite: bool,
     deletion_marked: bool,
 }
@@ -1183,17 +1240,37 @@ struct DirectoryEntry {
 #[derive(Default, serde::Serialize)]
 struct MoveImagesResult {
     moved: usize,
-    skipped: usize,
     errors: Vec<String>,
 }
 
-fn move_directory_images(
-    directory: &Path,
-    favourites: &Favourites,
-    deletion_marks: &DeletionMarks,
-    destination: &str,
-) -> io::Result<MoveImagesResult> {
-    let liked = destination == "favourites";
+fn available_destination_path(directory: &Path, file_name: &OsStr) -> io::Result<PathBuf> {
+    let target = directory.join(file_name);
+    match fs::symlink_metadata(&target) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(target),
+        Ok(_) => {}
+        Err(error) => return Err(error),
+    }
+
+    let file = Path::new(file_name);
+    let stem = file.file_stem().unwrap_or(file_name);
+    for index in 2.. {
+        let mut renamed = OsString::from(stem);
+        renamed.push(format!("_{index}"));
+        if let Some(extension) = file.extension() {
+            renamed.push(".");
+            renamed.push(extension);
+        }
+        let candidate = directory.join(renamed);
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+fn move_favourite_images(directory: &Path, state: &StateStore) -> io::Result<MoveImagesResult> {
     let mut result = MoveImagesResult::default();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -1203,30 +1280,21 @@ fn move_directory_images(
         }
         let outcome = (|| -> io::Result<()> {
             let source_key = fs::canonicalize(&source)?;
-            if favourites.contains(&source_key)? != liked {
+            if !state.is_favourite(&source_key)? {
                 return Ok(());
             }
-            let deletion_marked = deletion_marks.contains(&source_key)?;
-            let target_directory = directory.join(destination);
+            let deletion_marked = state.is_deletion_marked(&source_key)?;
+            let target_directory = directory.join("favourites");
             fs::create_dir_all(&target_directory)?;
-            let target = fs::canonicalize(target_directory)?.join(entry.file_name());
-            match fs::symlink_metadata(&target) {
-                Ok(_) => {
-                    result.skipped += 1;
-                    return Ok(());
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            let target_directory = fs::canonicalize(target_directory)?;
+            let target = available_destination_path(&target_directory, &entry.file_name())?;
             fs::rename(&source, &target)?;
             result.moved += 1;
-            favourites.set(&target, liked)?;
-            if liked {
-                favourites.set(&source_key, false)?;
-            }
+            state.set_favourite(&target, true)?;
+            state.set_favourite(&source_key, false)?;
             if deletion_marked {
-                deletion_marks.set(&target, true)?;
-                deletion_marks.set(&source_key, false)?;
+                state.set_deletion_mark(&target, true)?;
+                state.set_deletion_mark(&source_key, false)?;
             }
             Ok(())
         })();
@@ -1253,7 +1321,7 @@ struct ClearDeletionMarksResult {
 
 fn clear_directory_deletion_marks(
     directory: &Path,
-    deletion_marks: &DeletionMarks,
+    state: &StateStore,
 ) -> io::Result<ClearDeletionMarksResult> {
     let mut result = ClearDeletionMarksResult::default();
     for entry in fs::read_dir(directory)? {
@@ -1263,10 +1331,10 @@ fn clear_directory_deletion_marks(
             continue;
         }
         let canonical = fs::canonicalize(&path)?;
-        if !deletion_marks.contains(&canonical)? {
+        if !state.is_deletion_marked(&canonical)? {
             continue;
         }
-        match deletion_marks.set(&canonical, false) {
+        match state.set_deletion_mark(&canonical, false) {
             Ok(()) => result.cleared += 1,
             Err(error) => result
                 .errors
@@ -1278,8 +1346,7 @@ fn clear_directory_deletion_marks(
 
 fn delete_marked_images(
     directory: &Path,
-    favourites: &Favourites,
-    deletion_marks: &DeletionMarks,
+    state: &StateStore,
 ) -> io::Result<DeleteMarkedImagesResult> {
     let mut result = DeleteMarkedImagesResult::default();
     for entry in fs::read_dir(directory)? {
@@ -1297,7 +1364,7 @@ fn delete_marked_images(
                 continue;
             }
         };
-        if !deletion_marks.contains(&canonical)? {
+        if !state.is_deletion_marked(&canonical)? {
             continue;
         }
         if let Err(error) = fs::remove_file(&path) {
@@ -1307,10 +1374,7 @@ fn delete_marked_images(
             continue;
         }
         result.deleted += 1;
-        if let Err(error) = deletion_marks
-            .set(&canonical, false)
-            .and_then(|()| favourites.set(&canonical, false))
-        {
+        if let Err(error) = state.clear_image_state(&canonical) {
             result.errors.push(format!(
                 "{} 已删除，但清理缓存失败：{error}",
                 entry.file_name().to_string_lossy()
@@ -1371,17 +1435,14 @@ fn render_breadcrumbs(relative: &Path) -> String {
     breadcrumbs
 }
 
-fn render_directory_page(
-    root: &Path,
-    directory: &Path,
-    favourites: &Favourites,
-    deletion_marks: &DeletionMarks,
-) -> io::Result<String> {
+fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> io::Result<String> {
     let relative = directory.strip_prefix(root).unwrap_or(Path::new(""));
     let mut entries = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if review::is_review_sidecar(&entry.path()) {
+        if review::is_review_sidecar(&entry.path())
+            || gallery_comments::is_comments_file(&entry.path())
+        {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -1392,13 +1453,17 @@ fn render_directory_page(
             .then(|| fs::canonicalize(entry.path()))
             .transpose()?;
         let favourite = match canonical.as_deref() {
-            Some(path) => favourites.contains(path)?,
+            Some(path) => state.is_favourite(path)?,
             None => false,
         };
         let deletion_marked = match canonical.as_deref() {
-            Some(path) => deletion_marks.contains(path)?,
+            Some(path) => state.is_deletion_marked(path)?,
             None => false,
         };
+        let image_version = canonical
+            .as_deref()
+            .zip(metadata.as_ref())
+            .map(|(_, metadata)| file_version(metadata));
         entries.push(DirectoryEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry.path(),
@@ -1406,6 +1471,7 @@ fn render_directory_page(
                 .as_ref()
                 .map_or_else(|| file_type.is_dir(), fs::Metadata::is_dir),
             size: metadata.as_ref().map_or(0, fs::Metadata::len),
+            image_version,
             favourite,
             deletion_marked,
         });
@@ -1445,10 +1511,26 @@ fn render_directory_page(
         };
         let is_image = !entry.is_dir && is_image_file(&entry.path);
         let thumb = (!entry.is_dir)
-            .then(|| thumbnail_url(&href, &entry.path, entry.size, false))
+            .then(|| {
+                thumbnail_url(
+                    &href,
+                    &entry.path,
+                    entry.size,
+                    false,
+                    entry.image_version.as_deref(),
+                )
+            })
             .flatten();
         let gallery_thumb = gallery_available
-            .then(|| thumbnail_url(&href, &entry.path, entry.size, true))
+            .then(|| {
+                thumbnail_url(
+                    &href,
+                    &entry.path,
+                    entry.size,
+                    true,
+                    entry.image_version.as_deref(),
+                )
+            })
             .flatten();
         let class = match (entry.is_dir, is_image, has_extension(&entry.path, "svg")) {
             (true, _, _) => "folder",
@@ -1458,10 +1540,10 @@ fn render_directory_page(
         };
         let glyph = match (&thumb, &gallery_thumb) {
             (Some(src), Some(gallery_src)) => format!(
-                "<span class=\"glyph\" aria-hidden=\"true\"><img data-list-src=\"{src}\" data-gallery-src=\"{gallery_src}\" alt=\"\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
+                "<span class=\"glyph\" aria-hidden=\"true\"><img data-list-src=\"{src}\" data-gallery-src=\"{gallery_src}\" alt=\"\" decoding=\"async\" draggable=\"false\" onerror=\"this.hidden=true;this.closest('.glyph').classList.add('thumbnail-error')\"></span>"
             ),
             (Some(src), None) => format!(
-                "<span class=\"glyph\" aria-hidden=\"true\"><img data-list-src=\"{src}\" alt=\"\" decoding=\"async\" draggable=\"false\" onerror=\"this.closest('.entry').classList.remove('image','vector');this.remove()\"></span>"
+                "<span class=\"glyph\" aria-hidden=\"true\"><img data-list-src=\"{src}\" alt=\"\" decoding=\"async\" draggable=\"false\" onerror=\"this.hidden=true;this.closest('.glyph').classList.add('thumbnail-error')\"></span>"
             ),
             (None, _) => "<span class=\"glyph\" aria-hidden=\"true\"></span>".to_string(),
         };
@@ -1470,18 +1552,28 @@ fn render_directory_page(
             let deletion_hidden = if entry.deletion_marked { "" } else { " hidden" };
             glyph.replacen(
                 "</span>",
-                &format!("<span class=\"favourite-mark\" title=\"已点赞\"{favourite_hidden}>♥</span><span class=\"deletion-mark\" title=\"待删除\"{deletion_hidden}>待删除</span></span>"),
+                &format!("<span class=\"favourite-mark\" title=\"已点赞\"{favourite_hidden}><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 21c-.45 0-.85-.18-1.2-.5l-6.7-6.2C1.35 11.75 1.2 7.75 3.7 5.2 6.05 2.8 10 2.85 12 5.45c2-2.6 5.95-2.65 8.3-.25 2.5 2.55 2.35 6.55-.4 9.1l-6.7 6.2c-.35.32-.75.5-1.2.5Z\"></path></svg></span><span class=\"deletion-mark\" title=\"待删除\"{deletion_hidden}>待删除</span></span>"),
                 1,
             )
         } else {
             glyph
         };
         let preview = if is_image {
+            let version = entry.image_version.as_deref().unwrap_or_default();
+            let original_src = format!("{href}?mode=asset&amp;v={version}");
+            let preview_src = gallery_preview_url(
+                &href,
+                &entry.path,
+                entry.size,
+                entry.image_version.as_deref(),
+            )
+            .unwrap_or_else(|| original_src.clone());
             format!(
-                " data-favourite=\"{}\" data-deletion-marked=\"{}\" data-file-path=\"{}\" data-preview-src=\"{href}?mode=asset\" data-list-href=\"{href}\" data-gallery-href=\"{href}?view=gallery\"",
+                " data-favourite=\"{}\" data-deletion-marked=\"{}\" data-file-path=\"{}\" data-file-size=\"{}\" data-preview-src=\"{preview_src}\" data-original-src=\"{original_src}\" data-list-href=\"{href}\" data-gallery-href=\"{href}?view=gallery\"",
                 entry.favourite,
                 entry.deletion_marked,
-                escape_html(&entry_relative.to_string_lossy())
+                escape_html(&entry_relative.to_string_lossy()),
+                escape_html(&detail)
             )
         } else {
             String::new()
@@ -1494,6 +1586,7 @@ fn render_directory_page(
     rows.push_str(&format!(
         "<div class=\"empty\" id=\"directory-empty\" role=\"status\"{empty_hidden}><span aria-hidden=\"true\">∅</span><p>这个目录是空的</p></div>"
     ));
+    rows.push_str("<h2 class=\"gallery-other-heading\">其他文件</h2>");
 
     let title = escape_html(title);
     let gallery_toggle = if gallery_available {
@@ -1507,7 +1600,7 @@ fn render_directory_page(
         ""
     };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><figure><img alt=\"\"><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (m)\" aria-pressed=\"false\" title=\"标记待删除 (m)\">标记删除</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><nav class=\"scroll-jumps\" id=\"scroll-jumps\" aria-label=\"页面快速跳转\" hidden><button id=\"scroll-to-top\" type=\"button\" aria-label=\"回到顶部\" title=\"回到顶部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 14 6-6 6 6\"></path><path d=\"M6 19h12\"></path></svg></button><button id=\"scroll-to-bottom\" type=\"button\" aria-label=\"回到底部\" title=\"回到底部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 10 6 6 6-6\"></path><path d=\"M6 5h12\"></path></svg></button></nav><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><div class=\"lightbox-shell\"><div class=\"lightbox-position\" id=\"lightbox-position\" aria-live=\"polite\"></div><nav class=\"lightbox-filmstrip\" id=\"lightbox-filmstrip\" aria-label=\"图片缩略图导航\"></nav><figure><div class=\"lightbox-stage\"><img class=\"lightbox-image\" alt=\"\"><div class=\"favourite-burst\" id=\"favourite-burst\" aria-hidden=\"true\" hidden><svg viewBox=\"0 0 24 24\"><path d=\"M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z\"></path></svg></div></div><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (m)\" aria-pressed=\"false\" title=\"标记待删除 (m)\">标记删除</button><button class=\"carousel-toggle\" id=\"carousel-toggle\" type=\"button\" aria-label=\"进入轮播 (p)\" aria-pressed=\"false\" title=\"进入轮播 (p)\">轮播</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure></div>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
     ))
 }
 
@@ -1571,26 +1664,77 @@ fn should_use_gallery(image_count: usize, file_count: usize) -> bool {
     file_count > 0 && image_count > 0
 }
 
-fn thumbnail_url(href: &str, path: &Path, size: u64, gallery_mode: bool) -> Option<String> {
+fn thumbnail_url(
+    href: &str,
+    path: &Path,
+    size: u64,
+    gallery_mode: bool,
+    version: Option<&str>,
+) -> Option<String> {
     if size == 0 || size > MAX_THUMBNAIL_SOURCE || !is_image_file(path) {
         return None;
     }
+    let version = version?;
     if has_extension(path, "svg") {
-        Some(format!("{href}?mode=asset"))
+        Some(format!("{href}?mode=asset&amp;v={version}"))
     } else if gallery_mode {
-        Some(format!("{href}?mode=gallery-thumb"))
+        Some(format!("{href}?mode=gallery-thumb&amp;v={version}"))
     } else {
-        Some(format!("{href}?mode=thumb"))
+        Some(format!("{href}?mode=thumb&amp;v={version}"))
     }
+}
+
+fn gallery_preview_url(
+    href: &str,
+    path: &Path,
+    size: u64,
+    version: Option<&str>,
+) -> Option<String> {
+    if size == 0
+        || size > MAX_THUMBNAIL_SOURCE
+        || !is_raster_image(path)
+        || has_extension(path, "gif")
+    {
+        return None;
+    }
+    Some(format!("{href}?mode=gallery-preview&amp;v={}", version?))
+}
+
+fn file_version(metadata: &fs::Metadata) -> String {
+    let mut digest = Sha1::new();
+    digest.update(metadata.len().to_le_bytes());
+    if let Ok(modified) = metadata.modified() {
+        match modified.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => {
+                digest.update(duration.as_secs().to_le_bytes());
+                digest.update(duration.subsec_nanos().to_le_bytes());
+            }
+            Err(error) => {
+                let duration = error.duration();
+                digest.update(duration.as_secs().to_le_bytes());
+                digest.update(duration.subsec_nanos().to_le_bytes());
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        digest.update(metadata.dev().to_le_bytes());
+        digest.update(metadata.ino().to_le_bytes());
+        digest.update(metadata.ctime().to_le_bytes());
+        digest.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    hex_digest(&digest.finalize())
 }
 
 fn send_image_thumbnail(
     stream: &mut TcpStream,
     path: &Path,
-    size: u64,
+    metadata: &fs::Metadata,
     max_edge: u32,
     head_only: bool,
     cache: Option<&ImageCache>,
+    requested_version: Option<&str>,
     if_none_match: &str,
 ) -> io::Result<()> {
     if !is_raster_image(path) {
@@ -1602,27 +1746,32 @@ fn send_image_thumbnail(
             head_only,
         );
     }
-    if size == 0 || size > MAX_THUMBNAIL_SOURCE {
+    if metadata.len() == 0 || metadata.len() > MAX_THUMBNAIL_SOURCE {
         return send_text(
             stream,
             413,
             "Content Too Large",
-            "图片超过 16 MB，无法生成缩略图\n",
+            "图片超过 64 MB，无法生成预览图\n",
             head_only,
         );
     }
-    let source = fs::read(path)?;
-    let rendered = thumbnails::thumbnail(path, &source, max_edge, cache);
+    let version = file_version(metadata);
+    let rendered = thumbnails::thumbnail(path, &version, max_edge, cache, || {
+        let source = fs::read(path)?;
+        render_image_thumbnail(&source, max_edge)
+    });
     match rendered {
         Ok(thumbnail) => {
             let (bytes, content_type) = thumbnail.as_ref();
-            let etag = cache.map(|_| format!("\"{}\"", hex_digest(&Sha1::digest(bytes))));
+            let etag = cache.map(|_| format!("\"{version}-{max_edge}\""));
+            let immutable = cache.is_some() && requested_version == Some(version.as_str());
             let modified = send_image_headers(
                 stream,
                 bytes.len() as u64,
                 content_type,
                 etag.as_deref(),
                 if_none_match,
+                immutable,
             )?;
             if modified && !head_only {
                 stream.write_all(bytes)?;
@@ -1642,11 +1791,12 @@ fn send_image_thumbnail(
 fn render_image_thumbnail(source: &[u8], max_edge: u32) -> io::Result<(Vec<u8>, &'static str)> {
     let mut reader = image::ImageReader::new(Cursor::new(source)).with_guessed_format()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8_192);
-    limits.max_image_height = Some(8_192);
-    limits.max_alloc = Some(64 * 1024 * 1024);
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
     let image = reader.decode().map_err(image_io_error)?;
+    let max_edge = max_edge.min(image.width().max(image.height()));
     let thumb = image.thumbnail(max_edge, max_edge);
     let mut bytes = Vec::new();
     let mut cursor = Cursor::new(&mut bytes);
@@ -1657,7 +1807,12 @@ fn render_image_thumbnail(source: &[u8], max_edge: u32) -> io::Result<(Vec<u8>, 
         Ok((bytes, "image/png"))
     } else {
         let rgb = thumb.to_rgb8();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 82)
+        let quality = if max_edge > GALLERY_THUMBNAIL_MAX_EDGE {
+            86
+        } else {
+            82
+        };
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality)
             .encode_image(&rgb)
             .map_err(image_io_error)?;
         Ok((bytes, "image/jpeg"))
@@ -2390,10 +2545,9 @@ window.onDrawioViewerLoad = () => {
 "#;
 
 const GALLERY_ORGANISE_TOOLS: &str = r#"
-<div class="gallery-organise" id="gallery-organise" role="group" aria-label="整理当前目录的全部图片">
+<div class="gallery-organise" id="gallery-organise" role="group" aria-label="整理当前目录的已点赞图片">
   <span class="organise-label">整理到</span>
   <button type="button" data-move-images="favourites" title="将当前目录全部已点赞图片移入 favourites/" aria-label="将全部已点赞图片移入 favourites 目录"><span class="organise-heart" aria-hidden="true">♥</span> favourites <span class="organise-arrow" aria-hidden="true">↗</span></button>
-  <button type="button" data-move-images="unpopular" title="将当前目录全部未点赞图片移入 unpopular/" aria-label="将全部未点赞图片移入 unpopular 目录"><span aria-hidden="true">♡</span> unpopular <span class="organise-arrow" aria-hidden="true">↗</span></button>
   <button id="deletion-filter" type="button" aria-pressed="false"><span id="deletion-filter-label">查看待删除列表</span> <span id="deletion-count">0</span></button>
   <button id="delete-marked-images" class="delete-marked-images" type="button" hidden>删除所有已标记图片</button>
   <button id="clear-deletion-marks" type="button" hidden>取消所有删除标记</button>
@@ -2451,6 +2605,8 @@ const filterDirectory = () => {
   });
   document.querySelector('.summary').textContent = `${directoryCount} 个目录 · ${fileCount} 个文件`;
   directoryEmpty.hidden = directoryCount + fileCount > 0;
+  const otherHeading = listing.querySelector('.gallery-other-heading');
+  if (otherHeading) otherHeading.hidden = !Array.from(listing.querySelectorAll('.entry.file:not(.image)')).some(entry => !entry.hidden);
   directoryEmpty.querySelector('p').textContent = markedOnly
     ? '当前文件夹没有待删除图片'
     : query ? '没有匹配的文件或目录' : '这个目录是空的';
@@ -2458,21 +2614,146 @@ const filterDirectory = () => {
 directorySearch.addEventListener('input', filterDirectory);
 filterDirectory();
 
+const scrollJumps = document.querySelector('#scroll-jumps');
+const scrollToTop = scrollJumps.querySelector('#scroll-to-top');
+const scrollToBottom = scrollJumps.querySelector('#scroll-to-bottom');
+let scrollJumpFrame = null;
+const updateScrollJumps = () => {
+  scrollJumpFrame = null;
+  const maximum = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+  scrollJumps.hidden = maximum < 48;
+  scrollToTop.disabled = scrollY <= 4;
+  scrollToBottom.disabled = scrollY >= maximum - 4;
+};
+const scheduleScrollJumpUpdate = () => {
+  if (scrollJumpFrame !== null) return;
+  scrollJumpFrame = requestAnimationFrame(updateScrollJumps);
+};
+const jumpScroll = top => window.scrollTo({
+  top,
+  behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+});
+scrollToTop.addEventListener('click', () => jumpScroll(0));
+scrollToBottom.addEventListener('click', () => jumpScroll(document.documentElement.scrollHeight));
+addEventListener('scroll', scheduleScrollJumpUpdate, {passive: true});
+addEventListener('resize', scheduleScrollJumpUpdate);
+new ResizeObserver(scheduleScrollJumpUpdate).observe(document.body);
+updateScrollJumps();
+
 const galleryToggle = document.querySelector('#gallery-toggle');
 if (galleryToggle) {
   const organise = document.querySelector('#gallery-organise');
-  const moveButtons = organise.querySelectorAll('[data-move-images]');
+  const moveFavouriteButton = organise.querySelector('[data-move-images="favourites"]');
   const thumbnails = listing.querySelectorAll('img[data-list-src]');
   const lightbox = document.querySelector('#image-lightbox');
-  const lightboxImage = lightbox.querySelector('img');
+  const lightboxImage = lightbox.querySelector('.lightbox-image');
+  const lightboxStage = lightbox.querySelector('.lightbox-stage');
+  const lightboxBackdrop = document.createElement('div');
+  lightboxBackdrop.className = 'carousel-backdrop';
+  lightboxBackdrop.setAttribute('aria-hidden', 'true');
+  lightboxStage.prepend(lightboxBackdrop);
+  const lightboxPlaceholder = document.createElement('img');
+  lightboxPlaceholder.className = 'lightbox-placeholder';
+  lightboxPlaceholder.alt = '';
+  lightboxPlaceholder.setAttribute('aria-hidden', 'true');
+  lightboxPlaceholder.draggable = false;
+  lightboxStage.insertBefore(lightboxPlaceholder, lightboxStage.querySelector('.lightbox-image'));
+  const imageLoading = document.createElement('div');
+  imageLoading.className = 'image-loading';
+  imageLoading.hidden = true;
+  imageLoading.innerHTML = '<i aria-hidden="true"></i><span>正在载入清晰图片…</span>';
+  lightboxStage.append(imageLoading);
+  const imageLoadError = document.createElement('div');
+  imageLoadError.className = 'image-load-error';
+  imageLoadError.hidden = true;
+  imageLoadError.innerHTML = '<strong>图片加载失败</strong><button type="button">重新加载</button>';
+  lightboxStage.append(imageLoadError);
+  const heartParticles = document.createElement('div');
+  heartParticles.className = 'heart-particles';
+  heartParticles.setAttribute('aria-hidden', 'true');
+  lightbox.append(heartParticles);
+  for (let index = 0; index < 12; index++) {
+    const particle = document.createElement('span');
+    particle.hidden = true;
+    particle.innerHTML = '<svg viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z"></path></svg>';
+    heartParticles.append(particle);
+  }
+  const lightboxPosition = lightbox.querySelector('#lightbox-position');
+  const lightboxFilmstrip = lightbox.querySelector('#lightbox-filmstrip');
   const lightboxCaption = lightbox.querySelector('.lightbox-name');
   const favouriteToggle = lightbox.querySelector('#favourite-toggle');
+  const favouriteBurst = lightbox.querySelector('#favourite-burst');
   const favouriteError = lightbox.querySelector('#favourite-error');
   const deletionToggle = lightbox.querySelector('#deletion-toggle');
   const deletionMarkError = lightbox.querySelector('#deletion-mark-error');
   const previewPrevious = lightbox.querySelector('#preview-previous');
   const previewNext = lightbox.querySelector('#preview-next');
+  const carouselToggle = lightbox.querySelector('#carousel-toggle');
   const lightboxClose = lightbox.querySelector('.lightbox-close');
+  const carouselHud = document.createElement('div');
+  carouselHud.className = 'carousel-hud';
+  carouselHud.innerHTML = '<span class="carousel-notice" hidden></span><button type="button" data-carousel-pause>暂停</button><button type="button" data-carousel-exit>退出轮播</button>';
+  lightbox.append(carouselHud);
+  const viewerControls = lightbox.querySelector('.lightbox-controls');
+  const svgIcon = paths => `<svg viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>`;
+  const strokePath = path => `<path d="${path}"></path>`;
+  const commentToggle = document.createElement('button');
+  commentToggle.type = 'button';
+  commentToggle.className = 'comment-toggle';
+  commentToggle.title = '图片评论 (c)';
+  commentToggle.setAttribute('aria-label', commentToggle.title);
+  commentToggle.setAttribute('aria-expanded', 'false');
+  commentToggle.innerHTML = `${svgIcon(strokePath('M6.5 5.5h11a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H11l-4.5 3v-3a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z') + strokePath('M8 9.5h8M8 12.5h5'))}<b hidden>0</b>`;
+  viewerControls.insertBefore(commentToggle, deletionToggle);
+  const moreToggle = document.createElement('button');
+  moreToggle.type = 'button';
+  moreToggle.className = 'viewer-more-toggle';
+  moreToggle.title = '更多工具';
+  moreToggle.setAttribute('aria-label', moreToggle.title);
+  moreToggle.setAttribute('aria-expanded', 'false');
+  moreToggle.innerHTML = svgIcon(strokePath('m7 9.5 5 5 5-5'));
+  viewerControls.append(moreToggle);
+  const viewerExtras = document.createElement('div');
+  viewerExtras.className = 'viewer-extras';
+  viewerExtras.hidden = true;
+  viewerControls.after(viewerExtras);
+  const viewerTools = document.createElement('span');
+  viewerTools.className = 'viewer-tools';
+  viewerTools.innerHTML = `<button type="button" data-zoom="out" aria-label="缩小 (-)">${svgIcon(strokePath('M6 12h12'))}</button><button type="button" data-view="fit" aria-label="适应窗口 (0)">适屏</button><button type="button" data-view="fill" aria-label="填满窗口">填满</button><button type="button" data-view="actual" aria-label="原始尺寸 (1)">1:1</button><button type="button" data-zoom="in" aria-label="放大 (+)">${svgIcon(strokePath('M12 6v12M6 12h12'))}</button><button type="button" data-info aria-expanded="false" aria-label="图片信息">${svgIcon(strokePath('M12 11v5M12 8h.01') + '<circle cx="12" cy="12" r="9"></circle>')}</button>`;
+  const shortcutHelpToggle = document.createElement('button');
+  shortcutHelpToggle.type = 'button';
+  shortcutHelpToggle.className = 'shortcut-help-toggle';
+  shortcutHelpToggle.innerHTML = svgIcon(strokePath('M9.7 9a2.5 2.5 0 1 1 3.9 2.1c-1 .7-1.6 1.2-1.6 2.4M12 17h.01') + '<circle cx="12" cy="12" r="9"></circle>');
+  shortcutHelpToggle.title = '查看快捷键 (?)';
+  shortcutHelpToggle.setAttribute('aria-label', shortcutHelpToggle.title);
+  viewerExtras.append(viewerTools, shortcutHelpToggle);
+  const imageInfo = document.createElement('aside');
+  imageInfo.className = 'image-info';
+  imageInfo.hidden = true;
+  const shortcutHelp = document.createElement('aside');
+  shortcutHelp.className = 'shortcut-help';
+  shortcutHelp.hidden = true;
+  shortcutHelp.innerHTML = '<span>← → / J K 切图</span><span>F 点赞 · C 评论 · D / M 标记删除 · Ctrl K 直接删除</span><span>＋ − 缩放 · 0 适屏 · 1 原尺寸</span><span>I 图片信息 · P 轮播 · 空格暂停</span><span>Esc 退出</span>';
+  const figure = lightbox.querySelector('figure');
+  figure.append(imageInfo, shortcutHelp);
+  previewPrevious.innerHTML = svgIcon(strokePath('m15 6-6 6 6 6'));
+  previewNext.innerHTML = svgIcon(strokePath('m9 6 6 6-6 6'));
+  favouriteToggle.innerHTML = svgIcon(strokePath('M12 20.2 4.8 13a4.7 4.7 0 0 1 6.7-6.6l.5.5.5-.5a4.7 4.7 0 0 1 6.7 6.6L12 20.2Z') + strokePath('m17.2 4.2.45-1.3.45 1.3 1.3.45-1.3.45-.45 1.3-.45-1.3-1.3-.45 1.3-.45Z'));
+  deletionToggle.innerHTML = svgIcon(strokePath('m7 7 10 10M17 7 7 17'));
+  carouselToggle.innerHTML = svgIcon('<path class="icon-fill" d="m9 7 8 5-8 5Z"></path>' + strokePath('M5 5v14'));
+  lightboxClose.innerHTML = svgIcon(strokePath('m6 6 12 12M18 6 6 18'));
+  const lightboxState = document.createElement('div');
+  lightboxState.className = 'lightbox-state';
+  lightboxState.setAttribute('role', 'status');
+  lightboxState.innerHTML = `<span class="lightbox-favourite-state">${svgIcon('<path d="M12 21c-.45 0-.85-.18-1.2-.5l-6.7-6.2C1.35 11.75 1.2 7.75 3.7 5.2 6.05 2.8 10 2.85 12 5.45c2-2.6 5.95-2.65 8.3-.25 2.5 2.55 2.35 6.55-.4 9.1l-6.7 6.2c-.35.32-.75.5-1.2.5Z"></path>')}</span><span class="lightbox-deletion-state" hidden>待删除</span>`;
+  lightboxStage.append(lightboxState);
+  const commentsDrawer = document.createElement('aside');
+  commentsDrawer.className = 'gallery-comments';
+  commentsDrawer.hidden = true;
+  commentsDrawer.setAttribute('aria-label', '图片评论');
+  commentsDrawer.innerHTML = '<header><div><span>IMAGE NOTES</span><strong>图片评论</strong></div><button type="button" data-comments-close aria-label="关闭评论区"></button></header><div class="gallery-comments-image"><img alt=""><div><strong></strong><span></span></div><button type="button" data-comment-delete-all hidden>删除所有评论</button></div><div class="gallery-comment-list" role="feed"></div><div class="gallery-comment-empty"><strong>还没有评论</strong><span>记录构图、色彩或需要 AI 调整的细节。</span></div><form class="gallery-comment-composer"><div class="gallery-comment-identity" hidden><span>评论人 <strong></strong></span><button type="button" data-comment-change-author>更换</button></div><label data-comment-author>评论人<input name="author" autocomplete="name" placeholder="你的名字" required></label><label>评论内容<textarea name="body" rows="4" placeholder="例如：压低背景高光，让人物更突出…" required></textarea></label><p class="gallery-comment-hint">Enter 提交 · ⌘ Enter 换行</p><p class="gallery-comment-error" role="status" hidden></p><div><button type="button" data-comment-cancel hidden>取消编辑</button><button type="submit" class="comment-submit">添加评论</button></div></form><footer><a target="_blank">打开共享评论文件</a><span>.gallery-comments.json</span></footer>';
+  commentsDrawer.querySelector('[data-comments-close]').innerHTML = svgIcon(strokePath('m7 7 10 10M17 7 7 17'));
+  lightbox.append(commentsDrawer);
   const deleteDialog = document.querySelector('#delete-dialog');
   const deleteName = deleteDialog.querySelector('#delete-name');
   const deleteError = deleteDialog.querySelector('#delete-error');
@@ -2487,22 +2768,75 @@ if (galleryToggle) {
   const deleteMarkedCancel = deleteMarkedDialog.querySelector('#delete-marked-cancel');
   const deleteMarkedConfirm = deleteMarkedDialog.querySelector('#delete-marked-confirm');
   const mobileTouch = matchMedia('(hover: none) and (pointer: coarse)');
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity';
+  const imageModel = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]'));
+  const visibleImages = () => imageModel.filter(entry => entry.isConnected && !entry.hidden);
   let previewTrigger = null;
-  let deleteTimer = null;
   let deleting = false;
-  let liking = false;
+  let liking = 0;
   let marking = false;
   let moving = false;
-  let imageTouch = null;
-  let longPressTimer = null;
+  let lastImageTap = null;
+  let adjacentPreloads = [];
+  let carouselTimer = null;
+  let previewRequest = 0;
+  let loadingTimer = null;
+  let chromeTimer = null;
+  let mouseInChromeZone = false;
+  let carouselPaused = false;
+  let carouselQueue = [];
+  let lastCarouselEffect = null;
+  let zoom = {scale: 1, x: 0, y: 0, mode: 'fit', originalLoaded: false};
+  let pointerGesture = null;
+  let galleryComments = {version: 1, comments: []};
+  let galleryCommentsLoaded = false;
+  let galleryCommentsLoading = false;
+  let editingCommentId = null;
+  let deleteAllCommentsTimer = null;
+  const pendingFavourites = new WeakSet();
+  const galleryCommentList = commentsDrawer.querySelector('.gallery-comment-list');
+  const galleryCommentEmpty = commentsDrawer.querySelector('.gallery-comment-empty');
+  const galleryCommentComposer = commentsDrawer.querySelector('.gallery-comment-composer');
+  const galleryCommentAuthor = galleryCommentComposer.elements.author;
+  const galleryCommentAuthorLabel = galleryCommentComposer.querySelector('[data-comment-author]');
+  const galleryCommentIdentity = galleryCommentComposer.querySelector('.gallery-comment-identity');
+  const galleryCommentBody = galleryCommentComposer.elements.body;
+  const galleryCommentError = commentsDrawer.querySelector('.gallery-comment-error');
+  const galleryCommentSubmit = commentsDrawer.querySelector('.comment-submit');
+  const galleryCommentCancel = commentsDrawer.querySelector('[data-comment-cancel]');
+  const galleryCommentDeleteAll = commentsDrawer.querySelector('[data-comment-delete-all]');
+  const commentCount = commentToggle.querySelector('b');
+  const scrollToLatestGalleryComment = (smooth = true) => requestAnimationFrame(() => {
+    galleryCommentList.scrollTo({
+      top: galleryCommentList.scrollHeight,
+      behavior: smooth && !reducedMotion.matches ? 'smooth' : 'auto'
+    });
+  });
+  const syncGalleryCommentIdentity = () => {
+    const author = localStorage.getItem(REVIEW_IDENTITY_KEY)?.trim() || '';
+    galleryCommentAuthor.value = author;
+    galleryCommentAuthorLabel.hidden = Boolean(author);
+    galleryCommentIdentity.hidden = !author;
+    galleryCommentIdentity.querySelector('strong').textContent = author;
+  };
+  syncGalleryCommentIdentity();
+
+  const updateLightboxState = () => {
+    const liked = previewTrigger?.dataset.favourite === 'true';
+    const marked = previewTrigger?.dataset.deletionMarked === 'true';
+    lightboxState.querySelector('.lightbox-favourite-state').classList.toggle('liked', liked);
+    lightboxState.querySelector('.lightbox-deletion-state').hidden = !marked;
+    lightboxState.setAttribute('aria-label', `${liked ? '已点赞' : '未点赞'}${marked ? '，待删除' : ''}`);
+  };
 
   const updateFavouriteButton = () => {
     const liked = previewTrigger?.dataset.favourite === 'true';
-    favouriteToggle.textContent = liked ? '♥' : '♡';
     favouriteToggle.setAttribute('aria-pressed', String(liked));
     favouriteToggle.title = liked ? '取消点赞 (f)' : '点赞 (f)';
     favouriteToggle.setAttribute('aria-label', favouriteToggle.title);
-    favouriteToggle.disabled = liking;
+    favouriteToggle.disabled = previewTrigger ? pendingFavourites.has(previewTrigger) : false;
+    updateLightboxState();
   };
 
   const markedEntries = () => Array.from(
@@ -2511,43 +2845,456 @@ if (galleryToggle) {
 
   const updateDeletionControls = () => {
     const marked = previewTrigger?.dataset.deletionMarked === 'true';
-    deletionToggle.textContent = marked ? '取消标记' : '标记删除';
     deletionToggle.setAttribute('aria-pressed', String(marked));
-    deletionToggle.title = marked ? '取消待删除 (m)' : '标记待删除 (m)';
+    deletionToggle.title = marked ? '取消标记 (m)' : '标记删除 (m)';
     deletionToggle.setAttribute('aria-label', deletionToggle.title);
     deletionToggle.disabled = marking;
     const count = markedEntries().length;
     deletionCount.textContent = String(count);
     deleteMarkedButton.disabled = count === 0 || moving;
     clearDeletionMarksButton.disabled = count === 0 || moving;
+    updateLightboxState();
   };
 
   const updatePreviewButtons = () => {
-    const entries = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]:not([hidden])'));
+    const entries = visibleImages();
     const index = entries.indexOf(previewTrigger);
     previewPrevious.disabled = index <= 0;
     previewNext.disabled = index < 0 || index >= entries.length - 1;
+    carouselToggle.disabled = entries.length < 2;
+    lightboxPosition.textContent = index < 0 ? '' : `${index + 1} / ${entries.length}`;
+    const name = previewTrigger?.querySelector('.entry-name').textContent || '';
+    lightboxPosition.setAttribute('aria-label', index < 0 ? '' : `${name}，第 ${index + 1} 张，共 ${entries.length} 张`);
   };
 
-  const toggleFavourite = async () => {
-    if (!previewTrigger || lightbox.hidden || liking || deleting || moving || deleteDialog.open) return;
+  const currentImageName = () => previewTrigger?.querySelector('.entry-name').textContent || '';
+  const commentsEndpoint = () => `${previewTrigger.dataset.listHref}?mode=gallery-comments`;
+  const formatCommentTime = value => {
+    const time = new Date(value);
+    return Number.isNaN(time.getTime()) ? value : time.toLocaleString('zh-CN', {dateStyle: 'medium', timeStyle: 'short'});
+  };
+  const resetCommentComposer = () => {
+    editingCommentId = null;
+    galleryCommentBody.value = '';
+    galleryCommentCancel.hidden = true;
+    galleryCommentSubmit.textContent = '添加评论';
+    galleryCommentError.hidden = true;
+  };
+  const renderGalleryComments = () => {
+    if (!previewTrigger) return;
+    const name = currentImageName();
+    const comments = galleryComments.comments.filter(comment => comment.image === name);
+    commentCount.textContent = String(comments.length);
+    commentCount.hidden = comments.length === 0;
+    commentsDrawer.querySelector('.gallery-comments-image img').src = currentThumbnailSource(previewTrigger);
+    commentsDrawer.querySelector('.gallery-comments-image strong').textContent = name;
+    commentsDrawer.querySelector('.gallery-comments-image span').textContent = `${comments.length} 条评论`;
+    galleryCommentDeleteAll.hidden = comments.length === 0;
+    galleryCommentDeleteAll.dataset.confirm = 'false';
+    galleryCommentDeleteAll.textContent = '删除所有评论';
+    commentsDrawer.querySelector('footer a').href = new URL('.gallery-comments.json', location.href).href;
+    galleryCommentList.replaceChildren();
+    comments.forEach(comment => {
+      const article = document.createElement('article');
+      article.dataset.commentId = comment.id;
+      const header = document.createElement('header');
+      const author = document.createElement('strong');
+      author.textContent = comment.author;
+      const time = document.createElement('time');
+      time.dateTime = comment.edited_at || comment.created_at;
+      time.textContent = `${formatCommentTime(time.dateTime)}${comment.edited_at ? ' · 已编辑' : ''}`;
+      header.append(author, time);
+      const body = document.createElement('p');
+      body.textContent = comment.body;
+      const actions = document.createElement('div');
+      actions.innerHTML = '<button type="button" data-comment-edit>编辑</button><button type="button" data-comment-delete>删除</button>';
+      article.append(header, body, actions);
+      galleryCommentList.append(article);
+    });
+    galleryCommentEmpty.hidden = comments.length !== 0 || galleryCommentsLoading;
+  };
+  const loadGalleryComments = async () => {
+    if (!previewTrigger || galleryCommentsLoading || galleryCommentsLoaded) return;
+    galleryCommentsLoading = true;
+    galleryCommentEmpty.hidden = true;
+    commentsDrawer.classList.add('loading');
+    try {
+      const response = await fetch(commentsEndpoint());
+      if (!response.ok) throw new Error('评论加载失败，请重试。');
+      galleryComments = await response.json();
+      galleryCommentsLoaded = true;
+      renderGalleryComments();
+    } catch (error) {
+      galleryCommentError.textContent = error.message;
+      galleryCommentError.hidden = false;
+    } finally {
+      galleryCommentsLoading = false;
+      commentsDrawer.classList.remove('loading');
+      renderGalleryComments();
+    }
+  };
+  const closeGalleryComments = () => {
+    commentsDrawer.hidden = true;
+    commentToggle.setAttribute('aria-expanded', 'false');
+    resetCommentComposer();
+    showChrome();
+  };
+  const openGalleryComments = () => {
+    if (!previewTrigger) return;
+    syncGalleryCommentIdentity();
+    commentsDrawer.hidden = false;
+    commentToggle.setAttribute('aria-expanded', 'true');
+    renderGalleryComments();
+    loadGalleryComments().then(() => {
+      if (!commentsDrawer.hidden) scrollToLatestGalleryComment(false);
+    });
+    showChrome();
+    const input = galleryCommentAuthorLabel.hidden ? galleryCommentBody : galleryCommentAuthor;
+    input.focus({preventScroll: true});
+  };
+  const toggleGalleryComments = () => commentsDrawer.hidden ? openGalleryComments() : closeGalleryComments();
+  const submitGalleryCommentAction = async action => {
+    galleryCommentSubmit.disabled = true;
+    galleryCommentDeleteAll.disabled = true;
+    galleryCommentError.hidden = true;
+    try {
+      const response = await fetch(commentsEndpoint(), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(action)
+      });
+      if (!response.ok) throw new Error((await response.text()).trim() || '保存评论失败，请重试。');
+      galleryComments = await response.json();
+      galleryCommentsLoaded = true;
+      resetCommentComposer();
+      renderGalleryComments();
+      if (action.type === 'add') scrollToLatestGalleryComment();
+    } catch (error) {
+      galleryCommentError.textContent = error.message;
+      galleryCommentError.hidden = false;
+    } finally {
+      galleryCommentSubmit.disabled = false;
+      galleryCommentDeleteAll.disabled = false;
+    }
+  };
+
+  const renderFilmstrip = () => {
+    const entries = visibleImages();
+    const currentIndex = entries.indexOf(previewTrigger);
+    lightboxFilmstrip.replaceChildren();
+    for (let offset = -3; offset <= 3; offset++) {
+      const slot = document.createElement('span');
+      slot.className = 'filmstrip-slot';
+      slot.dataset.distance = String(Math.abs(offset));
+      const entry = entries[currentIndex + offset];
+      if (entry) {
+        const button = document.createElement('button');
+        button.className = 'filmstrip-thumb';
+        button.type = 'button';
+        button.setAttribute('aria-current', String(offset === 0));
+        const name = entry.querySelector('.entry-name').textContent;
+        button.setAttribute('aria-label', offset === 0 ? `当前图片：${name}` : `查看 ${name}`);
+        const image = document.createElement('img');
+        const listingImage = entry.querySelector('.glyph img');
+        image.src = listingImage?.dataset.gallerySrc || listingImage?.dataset.listSrc || entry.dataset.previewSrc;
+        image.alt = '';
+        image.decoding = 'async';
+        button.append(image);
+        button.addEventListener('click', () => switchPreview(entry, Math.sign(offset)));
+        slot.append(button);
+      }
+      lightboxFilmstrip.append(slot);
+    }
+  };
+
+  const preloadAdjacentImages = () => {
+    const entries = visibleImages();
+    const index = entries.indexOf(previewTrigger);
+    adjacentPreloads = [entries[index - 1], entries[index + 1]]
+      .filter(Boolean)
+      .map(entry => {
+        const image = new Image();
+        image.src = entry.dataset.previewSrc;
+        return image;
+      });
+  };
+
+  const currentThumbnailSource = entry => {
+    const image = entry?.querySelector('.glyph img');
+    return image?.dataset.gallerySrc || image?.dataset.listSrc || entry?.dataset.previewSrc || '';
+  };
+
+  const updateImageInfo = () => {
+    if (!previewTrigger) return;
+    const name = previewTrigger.querySelector('.entry-name').textContent;
+    const extension = name.includes('.') ? name.split('.').pop().toUpperCase() : 'IMAGE';
+    const dimensions = lightboxImage.naturalWidth
+      ? `${lightboxImage.naturalWidth} × ${lightboxImage.naturalHeight}`
+      : '尺寸读取中';
+    imageInfo.innerHTML = `<span>${extension}</span><span>${previewTrigger.dataset.fileSize}</span><span>${dimensions}</span><span>${Math.round(zoom.scale * 100)}%</span><a href="${previewTrigger.dataset.originalSrc}" target="_blank">打开原图</a>`;
+  };
+
+  const applyZoom = () => {
+    lightboxImage.style.transform = `translate3d(calc(${zoom.x}px + var(--gesture-x,0px)),calc(${zoom.y}px + var(--gesture-y,0px)),0) scale(${zoom.scale})`;
+    lightboxImage.classList.toggle('zoomed', zoom.scale > 1.01);
+    updateImageInfo();
+    updateLightboxStatePosition();
+  };
+
+  const loadOriginal = async () => {
+    if (!previewTrigger) return false;
+    if (zoom.originalLoaded || lightboxImage.src === new URL(previewTrigger.dataset.originalSrc, location.href).href) return true;
     const entry = previewTrigger;
+    const request = ++previewRequest;
+    const original = new Image();
+    original.src = entry.dataset.originalSrc;
+    try {
+      await original.decode();
+      if (previewTrigger !== entry || request !== previewRequest) return;
+      lightboxImage.src = original.src;
+      zoom.originalLoaded = true;
+      updateImageInfo();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const setZoom = (scale, origin = null) => {
+    const previous = zoom.scale;
+    zoom.scale = Math.min(8, Math.max(1, scale));
+    zoom.mode = zoom.scale === 1 ? 'fit' : 'custom';
+    if (origin && previous > 0) {
+      const rect = lightboxStage.getBoundingClientRect();
+      const ox = origin.x - rect.left - rect.width / 2;
+      const oy = origin.y - rect.top - rect.height / 2;
+      const ratio = zoom.scale / previous;
+      zoom.x = ox - (ox - zoom.x) * ratio;
+      zoom.y = oy - (oy - zoom.y) * ratio;
+    }
+    if (zoom.scale === 1) zoom.x = zoom.y = 0;
+    if (zoom.scale > 1.15) loadOriginal();
+    applyZoom();
+  };
+
+  const fittedImageSize = () => {
+    const stage = lightboxStage.getBoundingClientRect();
+    const width = lightboxImage.naturalWidth;
+    const height = lightboxImage.naturalHeight;
+    if (!width || !height) return {width: stage.width, height: stage.height};
+    const scale = Math.min(1, stage.width / width, stage.height / height);
+    return {width: width * scale, height: height * scale};
+  };
+
+  const updateLightboxStatePosition = () => {
+    const stage = lightboxStage.getBoundingClientRect();
+    const fitted = fittedImageSize();
+    const inset = 12;
+    lightboxState.style.right = `${Math.max(inset, (stage.width - fitted.width * zoom.scale) / 2 - zoom.x + inset)}px`;
+    lightboxState.style.bottom = `${Math.max(inset, (stage.height - fitted.height * zoom.scale) / 2 - zoom.y + inset)}px`;
+  };
+  addEventListener('resize', updateLightboxStatePosition);
+
+  const setViewMode = async mode => {
+    if (!previewTrigger) return;
+    if (mode === 'fit') {
+      zoom = {scale: 1, x: 0, y: 0, mode: 'fit', originalLoaded: zoom.originalLoaded};
+      return applyZoom();
+    }
+    if (mode === 'actual') {
+      if (!await loadOriginal()) return;
+      const fitted = fittedImageSize();
+      const scale = fitted.width
+        ? Math.min(8, Math.max(1, lightboxImage.naturalWidth / fitted.width))
+        : 1;
+      zoom = {scale, x: 0, y: 0, mode: 'actual', originalLoaded: zoom.originalLoaded};
+      return applyZoom();
+    }
+    const stage = lightboxStage.getBoundingClientRect();
+    const fitted = fittedImageSize();
+    if (!fitted.width || !fitted.height) return;
+    const scale = Math.min(8, Math.max(stage.width / fitted.width, stage.height / fitted.height));
+    zoom = {scale, x: 0, y: 0, mode: 'fill', originalLoaded: zoom.originalLoaded};
+    applyZoom();
+  };
+
+  viewerTools.addEventListener('click', event => {
+    const button = event.target.closest('button');
+    if (!button) return;
+    if (button.dataset.zoom === 'in') setZoom(zoom.scale * 1.25);
+    else if (button.dataset.zoom === 'out') setZoom(zoom.scale / 1.25);
+    else if (button.dataset.view) setViewMode(button.dataset.view);
+    else if (button.hasAttribute('data-info')) {
+      imageInfo.hidden = !imageInfo.hidden;
+      button.setAttribute('aria-expanded', String(!imageInfo.hidden));
+      updateImageInfo();
+    }
+  });
+  shortcutHelpToggle.addEventListener('click', () => {
+    shortcutHelp.hidden = !shortcutHelp.hidden;
+    shortcutHelpToggle.setAttribute('aria-expanded', String(!shortcutHelp.hidden));
+  });
+  moreToggle.addEventListener('click', () => {
+    viewerExtras.hidden = !viewerExtras.hidden;
+    moreToggle.setAttribute('aria-expanded', String(!viewerExtras.hidden));
+    moreToggle.classList.toggle('open', !viewerExtras.hidden);
+    showChrome();
+  });
+  commentToggle.addEventListener('click', toggleGalleryComments);
+  commentsDrawer.querySelector('[data-comments-close]').addEventListener('click', closeGalleryComments);
+  galleryCommentCancel.addEventListener('click', resetCommentComposer);
+  galleryCommentAuthor.addEventListener('change', () => {
+    const author = galleryCommentAuthor.value.trim();
+    if (author) localStorage.setItem(REVIEW_IDENTITY_KEY, author);
+    syncGalleryCommentIdentity();
+  });
+  galleryCommentComposer.querySelector('[data-comment-change-author]').addEventListener('click', () => {
+    galleryCommentIdentity.hidden = true;
+    galleryCommentAuthorLabel.hidden = false;
+    galleryCommentAuthor.focus();
+    galleryCommentAuthor.select();
+  });
+  galleryCommentComposer.addEventListener('submit', event => {
+    event.preventDefault();
+    const author = galleryCommentAuthor.value.trim();
+    const body = galleryCommentBody.value.trim();
+    if (!author || !body || !previewTrigger) return;
+    localStorage.setItem(REVIEW_IDENTITY_KEY, author);
+    syncGalleryCommentIdentity();
+    if (editingCommentId) {
+      submitGalleryCommentAction({
+        type: 'edit',
+        comment_id: editingCommentId,
+        body,
+        edited_at: new Date().toISOString()
+      });
+      return;
+    }
+    submitGalleryCommentAction({
+      type: 'add',
+      comment: {
+        id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        image: currentImageName(),
+        author,
+        body,
+        created_at: new Date().toISOString()
+      }
+    });
+  });
+  galleryCommentList.addEventListener('click', event => {
+    const article = event.target.closest('article[data-comment-id]');
+    if (!article) return;
+    const comment = galleryComments.comments.find(item => item.id === article.dataset.commentId);
+    if (!comment) return;
+    if (event.target.closest('[data-comment-edit]')) {
+      editingCommentId = comment.id;
+      galleryCommentBody.value = comment.body;
+      galleryCommentCancel.hidden = false;
+      galleryCommentSubmit.textContent = '保存修改';
+      galleryCommentBody.focus();
+      return;
+    }
+    const deleteButton = event.target.closest('[data-comment-delete]');
+    if (!deleteButton) return;
+    if (deleteButton.dataset.confirm !== 'true') {
+      deleteButton.dataset.confirm = 'true';
+      deleteButton.textContent = '确认删除';
+      setTimeout(() => {
+        if (!deleteButton.isConnected) return;
+        deleteButton.dataset.confirm = 'false';
+        deleteButton.textContent = '删除';
+      }, 2400);
+      return;
+    }
+    submitGalleryCommentAction({type: 'delete', comment_id: comment.id});
+  });
+  galleryCommentDeleteAll.addEventListener('click', () => {
+    if (galleryCommentDeleteAll.dataset.confirm !== 'true') {
+      galleryCommentDeleteAll.dataset.confirm = 'true';
+      galleryCommentDeleteAll.textContent = '确认全部删除';
+      clearTimeout(deleteAllCommentsTimer);
+      deleteAllCommentsTimer = setTimeout(() => {
+        galleryCommentDeleteAll.dataset.confirm = 'false';
+        galleryCommentDeleteAll.textContent = '删除所有评论';
+      }, 2400);
+      return;
+    }
+    clearTimeout(deleteAllCommentsTimer);
+    submitGalleryCommentAction({type: 'delete-all'});
+  });
+
+  const canAutoHideChrome = () => imageInfo.hidden && shortcutHelp.hidden
+    && commentsDrawer.hidden && viewerExtras.hidden && !mouseInChromeZone;
+  const showChrome = (hold = false) => {
+    lightbox.classList.remove('chrome-hidden');
+    clearTimeout(chromeTimer);
+    if (!hold && canAutoHideChrome()) {
+      chromeTimer = setTimeout(() => lightbox.classList.add('chrome-hidden'), 2500);
+    }
+  };
+
+  const animateFavouriteFeedback = (liked, origin = null) => {
+    favouriteToggle.getAnimations().forEach(animation => animation.cancel());
+    favouriteToggle.animate(reducedMotion.matches
+      ? [{opacity: .65}, {opacity: 1}]
+      : [
+          {transform: 'translateY(0) scale(1)'},
+          {transform: `translateY(${liked ? -6 : 2}px) scale(${liked ? 1.2 : .9})`, offset: .38},
+          {transform: 'translateY(0) scale(1)'}
+        ], {duration: reducedMotion.matches ? 160 : 420, easing: 'cubic-bezier(.16,1,.3,1)'});
+    if (reducedMotion.matches) return;
+    const particleRect = lightbox.getBoundingClientRect();
+    const buttonRect = favouriteToggle.getBoundingClientRect();
+    const startX = (origin?.x ?? (buttonRect.left + buttonRect.width / 2)) - particleRect.left;
+    const startY = (origin?.y ?? (buttonRect.top + buttonRect.height / 2)) - particleRect.top;
+    const count = liked ? 9 : 3;
+    Array.from(heartParticles.children).forEach((particle, index) => {
+      particle.getAnimations().forEach(animation => animation.cancel());
+      particle.hidden = index >= count;
+      if (particle.hidden) return;
+      particle.style.left = `${startX}px`;
+      particle.style.top = `${startY}px`;
+      particle.classList.toggle('outline', !liked);
+      const spread = liked ? 54 + (index % 3) * 18 : 20;
+      const angle = liked ? (-150 + index * 18) * Math.PI / 180 : (-110 + index * 20) * Math.PI / 180;
+      const x = Math.cos(angle) * spread;
+      const y = Math.sin(angle) * spread - (liked ? 34 + (index % 2) * 18 : 4);
+      const rotate = -28 + index * 11;
+      const scale = liked ? .68 + (index % 4) * .13 : .7;
+      const animation = particle.animate([
+        {transform: 'translate3d(-50%,-50%,0) scale(.25) rotate(0)', opacity: 0},
+        {transform: `translate3d(calc(-50% + ${x * .35}px),calc(-50% + ${y * .25}px),0) scale(${scale * 1.18}) rotate(${rotate * .4}deg)`, opacity: 1, offset: .28},
+        {transform: `translate3d(calc(-50% + ${x}px),calc(-50% + ${y}px),0) scale(${scale}) rotate(${rotate}deg)`, opacity: 0}
+      ], {duration: liked ? 570 + index * 34 : 360, delay: liked ? index * 24 : index * 35, easing: 'cubic-bezier(.16,1,.3,1)'});
+      animation.finished.catch(() => {}).finally(() => { particle.hidden = true; });
+    });
+  };
+
+  const toggleFavourite = async origin => {
+    if (!previewTrigger || lightbox.hidden || deleting || moving || deleteDialog.open) return;
+    const entry = previewTrigger;
+    if (pendingFavourites.has(entry)) return;
     const liked = entry.dataset.favourite !== 'true';
-    liking = true;
+    liking++;
+    pendingFavourites.add(entry);
     favouriteError.hidden = true;
+    entry.dataset.favourite = String(liked);
+    entry.querySelector('.favourite-mark').hidden = !liked;
     updateFavouriteButton();
+    animateFavouriteFeedback(liked, origin);
     try {
       const response = await fetch(`${entry.dataset.listHref}?mode=favourite`, {method: liked ? 'PUT' : 'DELETE'});
       if (!response.ok) throw new Error('保存点赞状态失败，请重试。');
-      entry.dataset.favourite = String(liked);
-      entry.querySelector('.favourite-mark').hidden = !liked;
     } catch (error) {
+      entry.dataset.favourite = String(!liked);
+      entry.querySelector('.favourite-mark').hidden = liked;
       if (previewTrigger === entry) {
         favouriteError.textContent = error.message;
         favouriteError.hidden = false;
       }
     } finally {
-      liking = false;
+      liking--;
+      pendingFavourites.delete(entry);
       updateFavouriteButton();
     }
   };
@@ -2559,13 +3306,15 @@ if (galleryToggle) {
     const marked = entry.dataset.deletionMarked !== 'true';
     marking = true;
     deletionMarkError.hidden = true;
+    entry.dataset.deletionMarked = String(marked);
+    entry.querySelector('.deletion-mark').hidden = !marked;
     updateDeletionControls();
     try {
       const response = await fetch(`${entry.dataset.listHref}?mode=deletion-mark`, {method: marked ? 'PUT' : 'DELETE'});
       if (!response.ok) throw new Error('保存待删除标记失败，请重试。');
-      entry.dataset.deletionMarked = String(marked);
-      entry.querySelector('.deletion-mark').hidden = !marked;
     } catch (error) {
+      entry.dataset.deletionMarked = String(!marked);
+      entry.querySelector('.deletion-mark').hidden = marked;
       if (previewTrigger === entry) {
         deletionMarkError.textContent = error.message;
         deletionMarkError.hidden = false;
@@ -2579,36 +3328,54 @@ if (galleryToggle) {
   previewPrevious.addEventListener('click', () => stepPreview(-1));
   previewNext.addEventListener('click', () => stepPreview(1));
 
-  moveButtons.forEach(button => button.addEventListener('click', async () => {
+  const moveDialog = document.createElement('dialog');
+  moveDialog.className = 'delete-dialog move-dialog';
+  moveDialog.innerHTML = '<h2>整理这些图片？</h2><p class="move-description"></p><div class="delete-actions"><button type="button" data-move-cancel autofocus>取消</button><button type="button" data-move-confirm>确认移动</button></div>';
+  document.body.append(moveDialog);
+  const moveFavouriteImages = async () => {
     if (moving || liking || marking || deleting) return;
     moving = true;
-    moveButtons.forEach(button => { button.disabled = true; });
-    const destination = button.dataset.moveImages;
-    directoryNotice.textContent = `正在移入 ${destination}/…`;
+    moveFavouriteButton.disabled = true;
+    directoryNotice.textContent = '正在移入 favourites/…';
     directoryNotice.hidden = false;
     try {
       const url = new URL(location.href);
-      url.search = `?mode=move-${destination}`;
+      url.search = '?mode=move-favourites';
       const response = await fetch(url, {method: 'POST'});
       if (!response.ok) throw new Error(await response.text());
       const result = await response.json();
-      let notice = `已将 ${result.moved} 张图片移入 ${destination}/`;
-      if (result.skipped) notice += `；${result.skipped} 张同名图片已跳过`;
+      let notice = `已将 ${result.moved} 张图片移入 favourites/`;
       if (result.errors.length) notice += `；未完成的操作：${result.errors.join('；')}`;
       history.replaceState({...history.state, moveNotice: notice, previewImage: null}, '');
       location.reload();
     } catch (error) {
       directoryNotice.textContent = error.message || '整理图片失败，请重试。';
       moving = false;
-      moveButtons.forEach(button => { button.disabled = false; });
+      moveFavouriteButton.disabled = false;
     }
-  }));
+  };
+  moveFavouriteButton.addEventListener('click', () => {
+    if (moving) return;
+    const count = imageModel.filter(entry => entry.dataset.favourite === 'true').length;
+    if (count === 0) {
+      directoryNotice.textContent = '没有图片需要移动';
+      directoryNotice.hidden = false;
+      return;
+    }
+    moveDialog.querySelector('.move-description').textContent = `将 ${count} 张已点赞图片移入 favourites/。同名文件会自动重命名。`;
+    moveDialog.showModal();
+  });
+  moveDialog.querySelector('[data-move-cancel]').addEventListener('click', () => moveDialog.close());
+  moveDialog.querySelector('[data-move-confirm]').addEventListener('click', () => {
+    moveDialog.close();
+    moveFavouriteImages();
+  });
 
   deletionFilter.addEventListener('click', () => {
     const enabled = deletionFilter.getAttribute('aria-pressed') !== 'true';
     deletionFilter.setAttribute('aria-pressed', String(enabled));
     deletionFilterLabel.textContent = enabled ? '查看全部图片' : '查看待删除列表';
-    moveButtons.forEach(button => { button.hidden = enabled; });
+    moveFavouriteButton.hidden = enabled;
     deleteMarkedButton.hidden = !enabled;
     clearDeletionMarksButton.hidden = !enabled;
     filterDirectory();
@@ -2628,7 +3395,7 @@ if (galleryToggle) {
     if (moving || markedEntries().length === 0) return;
     moving = true;
     clearDeletionMarksButton.textContent = '正在取消…';
-    moveButtons.forEach(button => { button.disabled = true; });
+    moveFavouriteButton.disabled = true;
     updateDeletionControls();
     try {
       const url = new URL(location.href);
@@ -2643,7 +3410,7 @@ if (galleryToggle) {
     } catch (error) {
       moving = false;
       clearDeletionMarksButton.textContent = '取消所有删除标记';
-      moveButtons.forEach(button => { button.disabled = false; });
+      moveFavouriteButton.disabled = false;
       directoryNotice.textContent = error.message || '取消删除标记失败，请重试。';
       directoryNotice.hidden = false;
       updateDeletionControls();
@@ -2692,7 +3459,7 @@ if (galleryToggle) {
       else visibleThumbnails.delete(target);
     });
     scheduleThumbnails();
-  });
+  }, {rootMargin: '100% 0px'});
 
   function loadVisibleThumbnails() {
     thumbnailFrame = null;
@@ -2707,12 +3474,12 @@ if (galleryToggle) {
       const source = gallery ? image.dataset.gallerySrc : image.dataset.listSrc;
       if (!source || loadingThumbnails.has(image) || loadedSources.get(image) === source) return;
       const rect = image.getBoundingClientRect();
-      if (rect.bottom <= 0 || rect.top >= innerHeight || rect.right <= 0 || rect.left >= innerWidth) return;
+      if (rect.bottom <= -innerHeight || rect.top >= innerHeight * 2 || rect.right <= 0 || rect.left >= innerWidth) return;
       candidates.push({image, source, distance: Math.abs((rect.top + rect.bottom) / 2 - innerHeight / 2)});
     });
     candidates.sort((left, right) => left.distance - right.distance);
     for (const {image, source} of candidates) {
-      if (loadingThumbnails.size >= 8) break;
+      if (loadingThumbnails.size >= 4) break;
       loadingThumbnails.add(image);
       const complete = event => {
         image.removeEventListener('load', complete);
@@ -2733,28 +3500,73 @@ if (galleryToggle) {
 
   thumbnails.forEach(image => thumbnailObserver.observe(image));
 
-  const clearDeleteTimer = () => {
-    clearTimeout(deleteTimer);
-    deleteTimer = null;
+  const carouselEffects = ['drift', 'lift', 'depth', 'soft-focus', 'curtain'];
+
+  const clearCarouselTimer = () => {
+    clearTimeout(carouselTimer);
+    carouselTimer = null;
+  };
+
+  const scheduleCarousel = () => {
+    clearCarouselTimer();
+    if (!lightbox.classList.contains('carousel-mode') || carouselPaused || lightbox.hidden || document.hidden || deleteDialog.open) return;
+    const entries = visibleImages();
+    carouselQueue = carouselQueue.filter(entry => entries.includes(entry) && entry !== previewTrigger);
+    if (!carouselQueue.length) carouselQueue = shuffle(entries.filter(entry => entry !== previewTrigger));
+    if (carouselQueue[0]) {
+      const next = new Image();
+      next.src = carouselQueue[0].dataset.previewSrc;
+      adjacentPreloads.push(next);
+    }
+    carouselTimer = setTimeout(advanceCarousel, 5000);
+  };
+
+  const shuffle = values => {
+    for (let index = values.length - 1; index > 0; index--) {
+      const next = Math.floor(Math.random() * (index + 1));
+      [values[index], values[next]] = [values[next], values[index]];
+    }
+    return values;
+  };
+
+  const advanceCarousel = () => {
+    const entries = visibleImages();
+    if (entries.length < 2) return scheduleCarousel();
+    const currentIndex = entries.indexOf(previewTrigger);
+    carouselQueue = carouselQueue.filter(entry => entries.includes(entry) && entry !== previewTrigger);
+    if (!carouselQueue.length) carouselQueue = shuffle(entries.filter(entry => entry !== previewTrigger));
+    const nextEntry = carouselQueue.shift();
+    const nextIndex = entries.indexOf(nextEntry);
+    const choices = carouselEffects.filter(effect => effect !== lastCarouselEffect);
+    const effect = choices[Math.floor(Math.random() * choices.length)];
+    lastCarouselEffect = effect;
+    switchPreview(nextEntry, nextIndex > currentIndex ? 1 : -1, effect);
   };
 
   const showDeleteDialog = () => {
     if (!previewTrigger || deleting || deleteDialog.open) return;
+    clearCarouselTimer();
     deleteName.textContent = previewTrigger.querySelector('.entry-name').textContent;
     deleteError.hidden = true;
     deleteDialog.showModal();
   };
 
-  const stepPreview = direction => {
-    const entries = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]:not([hidden])'));
+  const stepPreview = (direction, gestureOffset = null) => {
+    const entries = visibleImages();
     const nextEntry = entries[entries.indexOf(previewTrigger) + direction];
-    if (nextEntry) openLightbox(nextEntry);
+    if (!nextEntry) return false;
+    switchPreview(nextEntry, direction, null, gestureOffset);
+    return true;
   };
 
-  const clearImageTouch = () => {
-    clearTimeout(longPressTimer);
-    longPressTimer = null;
-    imageTouch = null;
+  const fullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+  const enterFullscreen = element => {
+    const request = element.requestFullscreen || element.webkitRequestFullscreen;
+    return request ? Promise.resolve(request.call(element)) : Promise.reject(new Error('Fullscreen is unavailable'));
+  };
+  const exitFullscreen = () => {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen;
+    return exit ? Promise.resolve(exit.call(document)) : Promise.resolve();
   };
 
   const setGallery = (enabled, updateUrl = true) => {
@@ -2776,42 +3588,317 @@ if (galleryToggle) {
     }
   };
 
+  const setCarousel = async enabled => {
+    if (enabled && (lightbox.hidden || carouselToggle.disabled)) return;
+    if (enabled && !commentsDrawer.hidden) closeGalleryComments();
+    lightbox.classList.toggle('carousel-mode', enabled);
+    carouselToggle.setAttribute('aria-pressed', String(enabled));
+    carouselToggle.title = enabled ? '退出轮播 (p)' : '进入轮播 (p)';
+    carouselToggle.setAttribute('aria-label', carouselToggle.title);
+    if (enabled) {
+      carouselPaused = false;
+      carouselQueue = [];
+      document.activeElement?.blur();
+      try {
+        if (!fullscreenElement()) await enterFullscreen(lightbox);
+      } catch (_) {
+        const notice = carouselHud.querySelector('.carousel-notice');
+        notice.textContent = '已使用网页全屏';
+        notice.hidden = false;
+        setTimeout(() => { notice.hidden = true; }, 2600);
+      }
+      showChrome();
+      scheduleCarousel();
+    } else {
+      clearCarouselTimer();
+      if (fullscreenElement() === lightbox) exitFullscreen().catch(() => {});
+      showChrome();
+    }
+  };
+
+  carouselToggle.addEventListener('click', () => setCarousel(true));
+  carouselHud.addEventListener('click', event => {
+    if (event.target.closest('[data-carousel-exit]')) setCarousel(false);
+    const pause = event.target.closest('[data-carousel-pause]');
+    if (pause) {
+      carouselPaused = !carouselPaused;
+      pause.textContent = carouselPaused ? '继续' : '暂停';
+      if (carouselPaused) clearCarouselTimer(); else scheduleCarousel();
+      showChrome();
+    }
+  });
+  const handleFullscreenChange = () => {
+    if (!fullscreenElement() && lightbox.classList.contains('carousel-mode')) {
+      lightbox.classList.remove('carousel-mode');
+      carouselToggle.setAttribute('aria-pressed', 'false');
+      carouselToggle.title = '进入轮播 (p)';
+      carouselToggle.setAttribute('aria-label', carouselToggle.title);
+      carouselPaused = false;
+      clearCarouselTimer();
+    }
+  };
+  document.addEventListener('fullscreenchange', handleFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+
   const closeLightbox = () => {
     if (lightbox.hidden || deleting) return;
-    clearDeleteTimer();
-    clearImageTouch();
+    clearTimeout(chromeTimer);
+    mouseInChromeZone = false;
+    setCarousel(false);
     if (deleteDialog.open) deleteDialog.close();
+    lightboxStage.getAnimations({subtree: true}).forEach(animation => animation.cancel());
+    lightboxStage.querySelectorAll('.preview-outgoing,.backdrop-outgoing').forEach(layer => layer.remove());
     lightbox.hidden = true;
+    commentsDrawer.hidden = true;
+    commentToggle.setAttribute('aria-expanded', 'false');
+    viewerExtras.hidden = true;
+    moreToggle.setAttribute('aria-expanded', 'false');
+    moreToggle.classList.remove('open');
+    previewRequest++;
+    clearTimeout(loadingTimer);
+    clearTimeout(chromeTimer);
     lightboxImage.removeAttribute('src');
+    lightboxPlaceholder.removeAttribute('src');
+    lightboxBackdrop.style.backgroundImage = '';
+    adjacentPreloads = [];
     document.body.classList.remove('lightbox-open');
+    document.querySelector('main').inert = false;
+    scrollJumps.inert = false;
     (previewTrigger || galleryToggle).focus();
     previewTrigger = null;
     history.replaceState({...history.state, previewImage: null}, '');
     filterDirectory();
   };
 
-  const openLightbox = entry => {
-    clearDeleteTimer();
+  const animatePreview = (outgoing, outgoingBackdrop, direction, effect, gestureOffset = null, gestureIncoming = null) => {
+    lightboxStage.getAnimations({subtree: true}).forEach(animation => animation.cancel());
+    lightboxStage.querySelectorAll('.preview-outgoing').forEach(image => {
+      if (image !== outgoing) image.remove();
+    });
+    lightboxStage.querySelectorAll('.backdrop-outgoing').forEach(layer => {
+      if (layer !== outgoingBackdrop) layer.remove();
+    });
+    const vertical = mobileTouch.matches;
+    const translate = amount => vertical
+      ? `translate3d(0, ${amount}%, 0)`
+      : `translate3d(${amount}%, 0, 0)`;
+    let outgoingFrames;
+    let incomingFrames;
+    if (gestureOffset !== null) {
+      const axisSize = vertical ? lightboxStage.clientHeight : lightboxStage.clientWidth;
+      const translatePixels = amount => vertical
+        ? `translate3d(0,${amount}px,0)`
+        : `translate3d(${amount}px,0,0)`;
+      outgoingFrames = [
+        {transform: translatePixels(gestureOffset), opacity: 1},
+        {transform: translatePixels(-direction * axisSize), opacity: 1}
+      ];
+      incomingFrames = [
+        {transform: translatePixels(direction * axisSize + gestureOffset), opacity: 1},
+        {transform: translatePixels(0), opacity: 1}
+      ];
+    } else if (reducedMotion.matches) {
+      outgoingFrames = [{opacity: 1}, {opacity: 0}];
+      incomingFrames = [{opacity: 0}, {opacity: 1}];
+    } else if (effect === 'drift') {
+      outgoingFrames = [
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1},
+        {transform: `translate3d(${-direction * 9}%,0,0) scale(1.025)`, opacity: 0}
+      ];
+      incomingFrames = [
+        {transform: `translate3d(${direction * 11}%,0,0) scale(.975)`, opacity: 0},
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1}
+      ];
+    } else if (effect === 'lift') {
+      outgoingFrames = [
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1},
+        {transform: `translate3d(0,${-direction * 10}%,0) scale(.98)`, opacity: 0}
+      ];
+      incomingFrames = [
+        {transform: `translate3d(0,${direction * 13}%,0) scale(1.02)`, opacity: 0},
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1}
+      ];
+    } else if (effect === 'depth') {
+      outgoingFrames = [
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1},
+        {transform: 'translate3d(0,0,0) scale(1.075)', opacity: 0}
+      ];
+      incomingFrames = [
+        {transform: 'translate3d(0,0,0) scale(.92)', opacity: 0},
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1}
+      ];
+    } else if (effect === 'soft-focus') {
+      outgoingFrames = [
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1},
+        {transform: `translate3d(${direction * -3}%,0,0) scale(1.035)`, opacity: 0}
+      ];
+      incomingFrames = [
+        {transform: `translate3d(${direction * 3}%,0,0) scale(1.035)`, opacity: 0},
+        {transform: 'translate3d(0,0,0) scale(1)', opacity: 1}
+      ];
+    } else if (effect === 'curtain') {
+      outgoingFrames = [
+        {transform: 'translate3d(0,0,0) scaleX(1)', opacity: 1},
+        {transform: `translate3d(${direction * -7}%,0,0) scaleX(.94)`, opacity: 0}
+      ];
+      incomingFrames = [
+        {transform: `translate3d(${direction * 7}%,0,0) scaleX(.94)`, opacity: 0},
+        {transform: 'translate3d(0,0,0) scaleX(1)', opacity: 1}
+      ];
+    } else {
+      outgoingFrames = [
+        {transform: translate(0), opacity: 1},
+        {transform: translate(-direction * 12), opacity: 0}
+      ];
+      incomingFrames = [
+        {transform: translate(direction * 12), opacity: 0},
+        {transform: translate(0), opacity: 1}
+      ];
+    }
+    const carouselTransition = Boolean(effect) && !reducedMotion.matches;
+    const gestureTransition = gestureOffset !== null;
+    const outgoingAnimation = outgoing.animate(outgoingFrames, {
+      duration: gestureTransition ? 230 : reducedMotion.matches ? 130 : carouselTransition ? 720 : 280,
+      easing: gestureTransition ? 'cubic-bezier(.22,.75,.28,1)' : 'cubic-bezier(.4,0,1,1)'
+    });
+    const incomingTarget = gestureIncoming || lightboxImage;
+    const incomingAnimation = incomingTarget.animate(incomingFrames, {
+      duration: gestureTransition ? 230 : reducedMotion.matches ? 130 : carouselTransition ? 980 : 280,
+      easing: 'cubic-bezier(.16,1,.3,1)'
+    });
+    outgoingAnimation.finished.catch(() => {}).finally(() => outgoing.remove());
+    if (gestureIncoming) incomingAnimation.finished.catch(() => {}).finally(() => gestureIncoming.remove());
+    if (outgoingBackdrop) {
+      const backdropDuration = reducedMotion.matches ? 150 : effect ? 1050 : 320;
+      const backdropOptions = {duration: backdropDuration, easing: 'cubic-bezier(.16,1,.3,1)'};
+      const outgoingBackdropAnimation = outgoingBackdrop.animate(reducedMotion.matches
+        ? [{opacity: .66}, {opacity: 0}]
+        : [
+            {transform: 'scale(1.08)', opacity: .66},
+            {transform: 'scale(1.14)', opacity: 0}
+          ], backdropOptions);
+      lightboxBackdrop.animate(reducedMotion.matches
+        ? [{opacity: 0}, {opacity: .66}]
+        : [
+            {transform: 'scale(1.14)', opacity: 0},
+            {transform: 'scale(1.08)', opacity: .66}
+          ], backdropOptions);
+      outgoingBackdropAnimation.finished.catch(() => {}).finally(() => outgoingBackdrop.remove());
+    }
+  };
+
+  const loadPreviewImage = async entry => {
+    const request = ++previewRequest;
+    clearTimeout(loadingTimer);
+    imageLoading.hidden = true;
+    imageLoadError.hidden = true;
+    lightboxImage.classList.add('loading');
+    const load = async source => {
+      const pending = new Image();
+      pending.src = source;
+      await pending.decode();
+      return pending;
+    };
+    loadingTimer = setTimeout(() => {
+      if (previewTrigger === entry && request === previewRequest) imageLoading.hidden = false;
+    }, 180);
+    try {
+      let loaded;
+      try {
+        loaded = await load(entry.dataset.previewSrc);
+      } catch (error) {
+        if (entry.dataset.previewSrc === entry.dataset.originalSrc) throw error;
+        loaded = await load(entry.dataset.originalSrc);
+      }
+      if (previewTrigger !== entry || request !== previewRequest || lightbox.hidden) return;
+      lightboxImage.src = loaded.src;
+      lightboxImage.classList.remove('loading');
+      lightboxPlaceholder.classList.add('loaded');
+      imageLoading.hidden = true;
+      zoom.originalLoaded = loaded.src === new URL(entry.dataset.originalSrc, location.href).href;
+      updateImageInfo();
+      updateLightboxStatePosition();
+    } catch (_) {
+      if (previewTrigger !== entry || request !== previewRequest) return;
+      imageLoading.hidden = true;
+      imageLoadError.hidden = false;
+    } finally {
+      clearTimeout(loadingTimer);
+    }
+  };
+
+  imageLoadError.querySelector('button').addEventListener('click', () => {
+    if (previewTrigger) loadPreviewImage(previewTrigger);
+  });
+
+  const showPreview = (entry, direction = 0, effect = null, gestureOffset = null) => {
+    lastImageTap = null;
+    let outgoing = null;
+    let outgoingBackdrop = null;
+    let gestureIncoming = null;
+    if (!lightbox.hidden && direction) {
+      if (gestureOffset !== null) {
+        gestureIncoming = lightboxStage.querySelector(`.gesture-neighbour[data-direction="${direction}"]`);
+      }
+      outgoing = lightboxImage.cloneNode();
+      outgoing.classList.add('preview-outgoing');
+      outgoing.setAttribute('aria-hidden', 'true');
+      lightboxStage.append(outgoing);
+      if (lightbox.classList.contains('carousel-mode')) {
+        outgoingBackdrop = lightboxBackdrop.cloneNode();
+        outgoingBackdrop.classList.add('backdrop-outgoing');
+        lightboxStage.append(outgoingBackdrop);
+      }
+    }
+    if (gestureOffset !== null) clearGestureLayers(gestureIncoming);
+    const opening = lightbox.hidden;
     previewTrigger = entry;
     lightbox.dataset.filePath = entry.dataset.filePath;
     const name = entry.querySelector('.entry-name').textContent;
-    lightboxImage.src = entry.dataset.previewSrc;
+    const thumbnailSource = currentThumbnailSource(entry);
+    lightboxPlaceholder.src = thumbnailSource;
+    lightboxPlaceholder.classList.remove('loaded');
+    lightboxBackdrop.style.backgroundImage = `url(${JSON.stringify(thumbnailSource)})`;
     lightboxImage.alt = name;
     lightboxCaption.textContent = name;
+    zoom = {scale: 1, x: 0, y: 0, mode: 'fit', originalLoaded: false};
+    applyZoom();
+    loadPreviewImage(entry);
     favouriteError.hidden = true;
     deletionMarkError.hidden = true;
     updateFavouriteButton();
     updateDeletionControls();
+    resetCommentComposer();
+    renderGalleryComments();
+    loadGalleryComments();
     lightbox.hidden = false;
     document.body.classList.add('lightbox-open');
-    lightboxClose.focus({preventScroll: true});
+    document.querySelector('main').inert = true;
+    scrollJumps.inert = true;
+    if (opening) {
+      clearTimeout(chromeTimer);
+      mouseInChromeZone = false;
+      lightbox.classList.add('chrome-hidden');
+      lightboxClose.focus({preventScroll: true});
+    }
     history.replaceState({...history.state, previewImage: entry.dataset.listHref}, '');
     updatePreviewButtons();
+    renderFilmstrip();
+    preloadAdjacentImages();
+    if (outgoing) animatePreview(outgoing, outgoingBackdrop, direction, effect, gestureOffset, gestureIncoming);
+  };
+
+  const openLightbox = entry => showPreview(entry);
+
+  const switchPreview = (entry, direction, effect = null, gestureOffset = null) => {
+    if (!entry || entry === previewTrigger || deleting || deleteDialog.open) return;
+    if (effect && !lightbox.classList.contains('carousel-mode')) return;
+    showPreview(entry, direction, effect, gestureOffset);
+    scheduleCarousel();
   };
 
   const deleteImage = async () => {
-    if (moving || marking || deleting || !previewTrigger) return;
-    clearDeleteTimer();
+    if (moving || marking || deleting || !previewTrigger || pendingFavourites.has(previewTrigger)) return;
     const entry = previewTrigger;
     deleting = true;
     deleteConfirm.disabled = deleteCancel.disabled = lightboxClose.disabled = true;
@@ -2820,7 +3907,7 @@ if (galleryToggle) {
     try {
       const response = await fetch(entry.dataset.listHref, {method: 'DELETE'});
       if (!response.ok) throw new Error('删除失败，请检查文件是否存在且可写后重试。');
-      const entries = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]:not([hidden])'));
+      const entries = visibleImages();
       const index = entries.indexOf(entry);
       const nextEntry = entries[index + 1] || entries[index - 1];
       if (deleteDialog.open) deleteDialog.close();
@@ -2851,11 +3938,11 @@ if (galleryToggle) {
   deleteDialog.addEventListener('cancel', event => {
     if (deleting) event.preventDefault();
   });
+  deleteDialog.addEventListener('close', scheduleCarousel);
 
   listing.addEventListener('click', event => {
-    const imageArea = event.target.closest('.entry.image .glyph');
-    if (!listing.classList.contains('gallery') || !imageArea) return;
-    const entry = imageArea.closest('.entry[data-preview-src]');
+    const entry = event.target.closest('.entry.image[data-preview-src]');
+    if (!listing.classList.contains('gallery') || !entry) return;
     if (!entry) return;
     event.preventDefault();
     openLightbox(entry);
@@ -2863,71 +3950,287 @@ if (galleryToggle) {
 
   lightboxClose.addEventListener('click', closeLightbox);
   lightbox.addEventListener('click', event => {
-    if (event.target === lightbox) closeLightbox();
+    const button = event.target.closest('button');
+    if (button && button !== lightboxClose && !lightbox.hidden) showChrome();
   });
-  lightbox.addEventListener('touchstart', event => {
-    clearImageTouch();
-    if (!mobileTouch.matches || event.touches.length !== 1 || deleting || deleteDialog.open) return;
-    const touch = event.touches[0];
-    imageTouch = {identifier: touch.identifier, x: touch.clientX, y: touch.clientY, longPressed: false};
-    if (event.target === lightboxImage) {
-      longPressTimer = setTimeout(() => {
-        if (!imageTouch) return;
-        imageTouch.longPressed = true;
-        longPressTimer = null;
-        showDeleteDialog();
-      }, 600);
+  const updateMouseChrome = event => {
+    if (event.pointerType !== 'mouse' || lightbox.hidden) return;
+    const controls = figure.querySelector('figcaption').getBoundingClientRect();
+    const inChromeZone = event.clientY >= Math.max(0, controls.top - 48);
+    if (inChromeZone) {
+      mouseInChromeZone = true;
+      showChrome(true);
+    } else if (mouseInChromeZone) {
+      mouseInChromeZone = false;
+      showChrome();
     }
-  }, {passive: true});
-  lightbox.addEventListener('touchmove', event => {
-    if (!imageTouch) return;
-    const touch = Array.from(event.touches).find(touch => touch.identifier === imageTouch.identifier);
-    if (!touch) return clearImageTouch();
-    const dx = touch.clientX - imageTouch.x;
-    const dy = touch.clientY - imageTouch.y;
-    if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
-      clearTimeout(longPressTimer);
-      longPressTimer = null;
+  };
+  lightbox.addEventListener('pointermove', updateMouseChrome, {passive: true});
+  lightbox.addEventListener('pointerleave', event => {
+    if (event.pointerType !== 'mouse' || !mouseInChromeZone) return;
+    mouseInChromeZone = false;
+    showChrome();
+  });
+  const activePointers = new Map();
+  const clearGestureLayers = (preserve = null) => {
+    lightboxStage.querySelectorAll('.gesture-neighbour').forEach(image => {
+      if (image !== preserve) image.remove();
+    });
+    lightboxImage.style.removeProperty('--gesture-x');
+    lightboxImage.style.removeProperty('--gesture-y');
+    lightboxPlaceholder.style.removeProperty('--gesture-x');
+    lightboxPlaceholder.style.removeProperty('--gesture-y');
+  };
+  const gestureNeighbour = direction => {
+    const entries = visibleImages();
+    const entry = entries[entries.indexOf(previewTrigger) + direction];
+    if (!entry) return null;
+    let image = lightboxStage.querySelector(`.gesture-neighbour[data-direction="${direction}"]`);
+    if (!image) {
+      image = document.createElement('img');
+      image.className = 'gesture-neighbour';
+      image.dataset.direction = direction;
+      image.src = currentThumbnailSource(entry);
+      image.alt = '';
+      image.draggable = false;
+      lightboxStage.append(image);
     }
-    if (Math.abs(dy) > Math.abs(dx)) event.preventDefault();
+    return image;
+  };
+  lightbox.addEventListener('pointerdown', event => {
+    if (deleting || deleteDialog.open || event.target.closest('button, dialog, a, input, textarea, .gallery-comments') || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    activePointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+    lightbox.setPointerCapture?.(event.pointerId);
+    if (activePointers.size === 2) {
+      const points = Array.from(activePointers.values());
+      pointerGesture = {pinch: true, distance: Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y), scale: zoom.scale};
+      return;
+    }
+    pointerGesture = {id: event.pointerId, x: event.clientX, y: event.clientY, lastX: event.clientX, lastY: event.clientY, time: performance.now(), velocity: 0, moved: false, imageTap: event.target === lightboxImage || event.target === lightboxPlaceholder};
+  });
+  lightbox.addEventListener('pointermove', event => {
+    if (!activePointers.has(event.pointerId) || !pointerGesture) return;
+    activePointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+    if (activePointers.size >= 2 && pointerGesture.pinch) {
+      const points = Array.from(activePointers.values());
+      const distance = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+      setZoom(pointerGesture.scale * distance / Math.max(1, pointerGesture.distance));
+      event.preventDefault();
+      return;
+    }
+    if (event.pointerId !== pointerGesture.id) return;
+    const now = performance.now();
+    const dx = event.clientX - pointerGesture.x;
+    const dy = event.clientY - pointerGesture.y;
+    const delta = mobileTouch.matches ? dy : dx;
+    const stepX = event.clientX - pointerGesture.lastX;
+    const stepY = event.clientY - pointerGesture.lastY;
+    pointerGesture.velocity = (mobileTouch.matches ? stepY : stepX) / Math.max(1, now - pointerGesture.time);
+    pointerGesture.lastX = event.clientX;
+    pointerGesture.lastY = event.clientY;
+    pointerGesture.time = now;
+    pointerGesture.moved ||= Math.hypot(dx, dy) > 8;
+    if (zoom.scale > 1.01) {
+      zoom.x += stepX;
+      zoom.y += stepY;
+      applyZoom();
+    } else if (Math.abs(delta) > Math.abs(mobileTouch.matches ? dx : dy)) {
+      const direction = delta < 0 ? 1 : -1;
+      const neighbour = gestureNeighbour(direction);
+      const resisted = neighbour ? delta : delta * .28;
+      const axisSize = mobileTouch.matches ? lightboxStage.clientHeight : lightboxStage.clientWidth;
+      const x = mobileTouch.matches ? 0 : resisted;
+      const y = mobileTouch.matches ? resisted : 0;
+      lightboxImage.style.setProperty('--gesture-x', `${x}px`);
+      lightboxImage.style.setProperty('--gesture-y', `${y}px`);
+      lightboxPlaceholder.style.setProperty('--gesture-x', `${x}px`);
+      lightboxPlaceholder.style.setProperty('--gesture-y', `${y}px`);
+      if (neighbour) {
+        const origin = direction * axisSize + resisted;
+        neighbour.style.transform = mobileTouch.matches ? `translate3d(0,${origin}px,0)` : `translate3d(${origin}px,0,0)`;
+      }
+    }
+    event.preventDefault();
+  });
+  const finishPointer = event => {
+    if (!activePointers.has(event.pointerId)) return;
+    activePointers.delete(event.pointerId);
+    if (!pointerGesture || pointerGesture.pinch) {
+      if (activePointers.size === 0) pointerGesture = null;
+      return;
+    }
+    const gesture = pointerGesture;
+    pointerGesture = null;
+    const dx = event.clientX - gesture.x;
+    const dy = event.clientY - gesture.y;
+    const delta = mobileTouch.matches ? dy : dx;
+    const threshold = (mobileTouch.matches ? lightboxStage.clientHeight : lightboxStage.clientWidth) * .22;
+    if (zoom.scale <= 1.01 && (Math.abs(delta) >= threshold || Math.abs(gesture.velocity) >= .55)) {
+      lastImageTap = null;
+      if (stepPreview(delta < 0 ? 1 : -1, delta)) return;
+    }
+    clearGestureLayers();
+    applyZoom();
+    if (gesture.moved) return;
+    showChrome();
+    if (!gesture.imageTap) {
+      lastImageTap = null;
+      return;
+    }
+    const now = performance.now();
+    const doubleTap = lastImageTap && now - lastImageTap.time < 320
+      && Math.hypot(event.clientX - lastImageTap.x, event.clientY - lastImageTap.y) < 36;
+    if (doubleTap && mobileTouch.matches) {
+      clearTimeout(lastImageTap.timer);
+      lastImageTap = null;
+      toggleFavourite({x: event.clientX, y: event.clientY});
+    } else if (doubleTap) {
+      clearTimeout(lastImageTap.timer);
+      lastImageTap = null;
+      setViewMode(zoom.scale > 1.01 ? 'fit' : 'actual');
+    } else if (mobileTouch.matches) {
+      const tap = {time: now, x: event.clientX, y: event.clientY};
+      tap.timer = setTimeout(() => {
+        if (lastImageTap !== tap) return;
+        lastImageTap = null;
+      }, 320);
+      lastImageTap = tap;
+    } else {
+      lastImageTap = null;
+    }
+  };
+  lightbox.addEventListener('pointerup', finishPointer);
+  lightbox.addEventListener('pointercancel', event => {
+    activePointers.delete(event.pointerId);
+    pointerGesture = null;
+    clearGestureLayers();
+    applyZoom();
+  });
+  lightboxStage.addEventListener('wheel', event => {
+    if (lightbox.hidden) return;
+    event.preventDefault();
+    setZoom(zoom.scale * Math.exp(-event.deltaY * .0015), {x: event.clientX, y: event.clientY});
+    showChrome();
   }, {passive: false});
-  lightbox.addEventListener('touchend', event => {
-    if (!imageTouch) return;
-    const gesture = imageTouch;
-    const touch = Array.from(event.changedTouches).find(touch => touch.identifier === gesture.identifier);
-    clearImageTouch();
-    if (!touch || gesture.longPressed || deleteDialog.open) return;
-    const dx = touch.clientX - gesture.x;
-    const dy = touch.clientY - gesture.y;
-    if (Math.abs(dy) >= 50 && Math.abs(dy) > Math.abs(dx)) stepPreview(dy < 0 ? 1 : -1);
-  }, {passive: true});
-  lightbox.addEventListener('touchcancel', clearImageTouch, {passive: true});
-  lightboxImage.addEventListener('contextmenu', event => {
-    if (mobileTouch.matches) event.preventDefault();
-  });
   document.addEventListener('keydown', event => {
     if (deleting || deleteDialog.open) return;
-    if (event.key === 'Escape') closeLightbox();
-    if (lightbox.hidden) return;
-    if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) {
-      clearDeleteTimer();
+    const commentEditorActive = !commentsDrawer.hidden
+      && (event.target === galleryCommentAuthor || event.target === galleryCommentBody);
+    if (commentEditorActive) {
+      if (event.isComposing) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.target.blur();
+      } else if (event.target === galleryCommentAuthor && event.key === 'Enter') {
+        event.preventDefault();
+        galleryCommentBody.focus();
+      } else if (event.target === galleryCommentBody && event.key === 'Enter') {
+        event.preventDefault();
+        if (event.metaKey) {
+          galleryCommentBody.setRangeText('\n', galleryCommentBody.selectionStart, galleryCommentBody.selectionEnd, 'end');
+        } else {
+          galleryCommentComposer.requestSubmit();
+        }
+      }
       return;
     }
-    if (event.key === 'd') {
+    if (event.key === 'Escape') {
+      if (!commentsDrawer.hidden) closeGalleryComments();
+      else if (!viewerExtras.hidden) {
+        viewerExtras.hidden = true;
+        moreToggle.setAttribute('aria-expanded', 'false');
+        moreToggle.classList.remove('open');
+      }
+      else if (lightbox.classList.contains('carousel-mode')) setCarousel(false);
+      else closeLightbox();
+      return;
+    }
+    if (lightbox.hidden) return;
+    if (event.key === 'Tab') {
+      const focusable = Array.from(lightbox.querySelectorAll('button:not(:disabled),a[href]'))
+        .filter(element => element.offsetParent !== null);
+      if (!focusable.length) return;
+      const index = focusable.indexOf(document.activeElement);
+      const next = event.shiftKey
+        ? focusable[(index <= 0 ? focusable.length : index) - 1]
+        : focusable[(index + 1) % focusable.length];
+      event.preventDefault();
+      next.focus();
+      return;
+    }
+    if (event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      if (!event.repeat) deleteImage();
+      return;
+    }
+    if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) {
+      return;
+    }
+    if (event.key.toLowerCase() === 'd') {
       event.preventDefault();
       if (event.repeat) return;
-      if (deleteTimer !== null) deleteImage();
-      else deleteTimer = setTimeout(() => {
-        deleteTimer = null;
-        showDeleteDialog();
-      }, 350);
+      toggleDeletionMark();
       return;
     }
-    clearDeleteTimer();
+    if (event.key === '+' || event.key === '=') {
+      event.preventDefault();
+      setZoom(zoom.scale * 1.25);
+      return;
+    }
+    if (event.key === '-') {
+      event.preventDefault();
+      setZoom(zoom.scale / 1.25);
+      return;
+    }
+    if (event.key === '0') {
+      event.preventDefault();
+      setViewMode('fit');
+      return;
+    }
+    if (event.key === '1') {
+      event.preventDefault();
+      setViewMode('actual');
+      return;
+    }
+    if (event.key.toLowerCase() === 'i') {
+      event.preventDefault();
+      imageInfo.hidden = !imageInfo.hidden;
+      viewerTools.querySelector('[data-info]').setAttribute('aria-expanded', String(!imageInfo.hidden));
+      updateImageInfo();
+      showChrome();
+      return;
+    }
+    if (event.key === '?') {
+      event.preventDefault();
+      shortcutHelp.hidden = !shortcutHelp.hidden;
+      shortcutHelpToggle.setAttribute('aria-expanded', String(!shortcutHelp.hidden));
+      showChrome();
+      return;
+    }
+    if (event.key === ' ' && lightbox.classList.contains('carousel-mode')) {
+      event.preventDefault();
+      carouselPaused = !carouselPaused;
+      carouselHud.querySelector('[data-carousel-pause]').textContent = carouselPaused ? '继续' : '暂停';
+      if (carouselPaused) clearCarouselTimer(); else scheduleCarousel();
+      showChrome();
+      return;
+    }
+    if (event.key === 'p') {
+      if (event.repeat || event.target.closest('input, textarea, select') || event.target.isContentEditable) return;
+      event.preventDefault();
+      setCarousel(!lightbox.classList.contains('carousel-mode'));
+      return;
+    }
     if (event.key === 'f') {
       if (event.repeat || event.target.closest('input, textarea, select') || event.target.isContentEditable) return;
       event.preventDefault();
       toggleFavourite();
+      return;
+    }
+    if (event.key.toLowerCase() === 'c') {
+      if (event.repeat || event.target.closest('input, textarea, select') || event.target.isContentEditable) return;
+      event.preventDefault();
+      toggleGalleryComments();
       return;
     }
     if (event.key === 'm') {
@@ -2944,6 +4247,11 @@ if (galleryToggle) {
     stepPreview(direction);
   });
 
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearCarouselTimer();
+    else scheduleCarousel();
+  });
+
   galleryToggle.addEventListener('click', () => {
     if (deleting) return;
     const enabled = !listing.classList.contains('gallery');
@@ -2954,7 +4262,7 @@ if (galleryToggle) {
   setGallery(new URLSearchParams(location.search).get('view') === 'gallery', false);
   updateDeletionControls();
   if (listing.classList.contains('gallery') && history.state?.previewImage) {
-    const entry = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]:not([hidden])'))
+    const entry = visibleImages()
       .find(entry => entry.dataset.listHref === history.state.previewImage);
     if (entry) openLightbox(entry);
   }
@@ -2969,16 +4277,23 @@ const DIRECTORY_CSS: &str = r#"
 :root { color-scheme:light dark; --paper:#f7f8fc; --surface:#fff; --ink:#202333; --muted:#73788b; --line:#dfe3ee; --accent:#5b5bd6; --accent-soft:#eeeeff; --folder:#6970e8; --grid:#e4e7f0; }
 * { box-sizing:border-box; }
 [hidden] { display:none !important; }
-html { font-size:16px; }
+html { font-size:16px; scrollbar-color:var(--muted) var(--paper); }
 body { min-height:100vh; margin:0; color:var(--ink); background:var(--paper); font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC",sans-serif; }
+::selection { color:var(--surface); background:var(--accent); }
 body.lightbox-open { overflow:hidden; }
+.scroll-jumps { position:fixed; z-index:15; top:50%; right:max(.65rem,env(safe-area-inset-right)); display:grid; overflow:hidden; border-radius:.75rem; background:color-mix(in srgb,var(--surface) 88%,transparent); box-shadow:0 10px 30px rgba(27,31,52,.18); backdrop-filter:blur(14px); transform:translateY(-50%); }
+.scroll-jumps button { display:grid; place-items:center; width:2.65rem; height:2.65rem; padding:0; border:0; color:var(--muted); background:transparent; cursor:pointer; }
+.scroll-jumps button+button { border-top:1px solid var(--line); }
+.scroll-jumps button:hover:not(:disabled) { color:var(--accent); background:var(--accent-soft); }
+.scroll-jumps button:disabled { opacity:.28; cursor:default; }
+.scroll-jumps svg { width:1.15rem; height:1.15rem; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
 main { width:min(100% - 2rem,980px); margin:0 auto; padding:clamp(1.5rem,6vw,5rem) 0; }
 .gallery-mode main { width:min(100% - 2rem,1320px); }
 .breadcrumbs { display:flex; align-items:center; gap:.55rem; overflow-x:auto; padding-bottom:1rem; color:var(--muted); font:600 .78rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; scrollbar-width:none; }
 .breadcrumbs a { color:inherit; text-decoration:none; white-space:nowrap; }
 .breadcrumbs a:hover { color:var(--accent); }
-header { position:relative; padding:clamp(1.4rem,4vw,2.5rem); overflow:hidden; border:1px solid var(--line); border-radius:1.1rem 1.1rem 0 0; background:var(--surface); }
-header::after { position:absolute; right:-1.4rem; bottom:-3.2rem; width:9rem; height:7rem; border:1.1rem solid var(--accent-soft); border-radius:1.2rem; content:""; transform:rotate(-8deg); }
+main>header { position:relative; padding:clamp(1.4rem,4vw,2.5rem); overflow:hidden; border:1px solid var(--line); border-radius:1.1rem 1.1rem 0 0; background:var(--surface); }
+main>header::after { position:absolute; right:-1.4rem; bottom:-3.2rem; width:9rem; height:7rem; border:1.1rem solid var(--accent-soft); border-radius:1.2rem; content:""; transform:rotate(-8deg); }
 .view-toggle { position:absolute; z-index:2; right:clamp(1rem,3vw,2rem); top:clamp(1rem,3vw,2rem); display:flex; align-items:center; gap:.45rem; min-height:2.35rem; padding:.55rem .8rem; border:1px solid var(--line); border-radius:.65rem; color:var(--ink); background:var(--surface); box-shadow:0 6px 18px rgba(54,59,92,.08); font:700 .75rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
 .view-toggle:hover,.view-toggle[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
 .view-toggle span { font-size:1rem; }
@@ -2999,9 +4314,9 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .organise-arrow { opacity:.6; }
 .directory-notice { position:relative; z-index:1; margin:.75rem 0 0; color:var(--muted); font-size:.78rem; line-height:1.6; overflow-wrap:anywhere; }
 .listing { overflow:hidden; border:1px solid var(--line); border-top:0; border-radius:0 0 1.1rem 1.1rem; background:var(--surface); box-shadow:0 25px 70px rgba(54,59,92,.09); }
-.entry { display:grid; grid-template-columns:2.55rem minmax(0,1fr) 5rem 6rem 1.5rem; align-items:center; gap:.85rem; min-height:4.25rem; padding:.7rem 1.2rem; border-top:1px solid var(--line); color:var(--ink); text-decoration:none; transition:background .15s ease,padding-left .15s ease; }
+.entry { display:grid; grid-template-columns:2.55rem minmax(0,1fr) 5rem 6rem 1.5rem; align-items:center; gap:.85rem; min-height:4.25rem; padding:.7rem 1.2rem; border-top:1px solid var(--line); color:var(--ink); text-decoration:none; transition:background .15s ease,transform .18s cubic-bezier(.16,1,.3,1); }
 .entry:first-child { border-top:0; }
-.entry:hover { padding-left:1.45rem; background:var(--accent-soft); }
+.entry:hover { background:var(--accent-soft); transform:translateX(.2rem); }
 .entry-name { overflow:hidden; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
 .kind { justify-self:start; padding:.2rem .45rem; border:1px solid var(--line); border-radius:.3rem; color:var(--muted); font:700 .62rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.04em; }
 .detail { justify-self:end; color:var(--muted); font:500 .75rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
@@ -3013,15 +4328,19 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .file .glyph::after { position:absolute; right:-2px; top:-2px; width:.42rem; height:.42rem; border-left:2px solid var(--muted); border-bottom:2px solid var(--muted); background:var(--surface); content:""; }
 .entry.image .glyph { width:2.55rem; height:2.55rem; overflow:hidden; border:1px solid var(--line); border-radius:.55rem; background-color:var(--surface); background-image:linear-gradient(45deg,var(--grid) 25%,transparent 25%),linear-gradient(-45deg,var(--grid) 25%,transparent 25%),linear-gradient(45deg,transparent 75%,var(--grid) 75%),linear-gradient(-45deg,transparent 75%,var(--grid) 75%); background-position:0 0,0 5px,5px -5px,-5px 0; background-size:10px 10px; box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--line) 65%,transparent); opacity:1; }
 .entry.image .glyph::after { content:none; }
-.favourite-mark { position:absolute; right:.1rem; bottom:.1rem; display:grid; place-items:center; width:1.1rem; height:1.1rem; border-radius:50%; color:#e33c60; background:#fff; font:700 .85rem/1 sans-serif; pointer-events:none; }
-.gallery .favourite-mark { right:.4rem; bottom:.4rem; width:1.5rem; height:1.5rem; font-size:1.1rem; }
+.favourite-mark { position:absolute; right:.1rem; bottom:.1rem; display:block; width:1rem; height:1rem; color:#ff4f78; filter:drop-shadow(0 2px 4px rgba(0,0,0,.55)); pointer-events:none; }
+.favourite-mark svg { display:block; width:100%; height:100%; overflow:visible; }
+.favourite-mark path { fill:currentColor; stroke:rgba(255,255,255,.9); stroke-width:.75; stroke-linejoin:round; }
+.gallery .favourite-mark { right:.45rem; bottom:.45rem; width:1.35rem; height:1.35rem; }
 .deletion-mark { position:absolute; left:.15rem; top:.15rem; padding:.15rem .3rem; border-radius:.3rem; color:#fff; background:#b42336; box-shadow:0 2px 7px rgba(0,0,0,.25); font:700 .52rem/1.2 ui-sans-serif,-apple-system,sans-serif; white-space:nowrap; pointer-events:none; }
 .gallery .deletion-mark { left:.4rem; top:.4rem; padding:.25rem .4rem; font-size:.65rem; }
 .entry.image .glyph img { width:100%; height:100%; object-fit:cover; object-position:center; display:block; pointer-events:none; transition:transform .2s ease; }
 .entry.image .glyph img:not([src]) { visibility:hidden; }
+.entry.image .glyph.thumbnail-error::before { position:absolute; inset:0; display:grid; place-items:center; padding:.5rem; color:var(--muted); content:"预览不可用"; font:600 .62rem/1.35 ui-sans-serif,-apple-system,sans-serif; text-align:center; }
 .entry.image:hover .glyph img { transform:scale(1.06); }
 .entry.image.vector .glyph img { object-fit:contain; padding:.2rem; }
-.listing.gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:1rem; padding:1rem; overflow:visible; }
+.gallery-other-heading { display:none; }
+.listing.gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:.42rem; padding:.42rem; overflow:visible; background:color-mix(in srgb,var(--surface) 88%,#0b0c12); }
 .gallery .entry { grid-template-columns:minmax(0,1fr) auto; grid-template-rows:11rem auto auto; gap:.65rem .75rem; min-width:0; min-height:0; padding:.75rem; overflow:hidden; border:1px solid var(--line); border-radius:.8rem; background:var(--surface); transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease; }
 .gallery .entry:first-child { border-top:1px solid var(--line); }
 .gallery .entry:hover { padding:.75rem; border-color:color-mix(in srgb,var(--accent) 45%,var(--line)); background:var(--surface); box-shadow:0 14px 30px rgba(54,59,92,.14); transform:translateY(-3px); }
@@ -3033,6 +4352,18 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .gallery .arrow { display:none; }
 .gallery .folder .glyph,.gallery .file:not(.image) .glyph { transform:scale(1.35); }
 .gallery .entry.image .glyph { cursor:zoom-in; }
+.listing.gallery .entry.folder { order:-1; }
+.listing.gallery .entry.image { position:relative; order:0; display:block; min-height:0; aspect-ratio:1; padding:0; overflow:hidden; border:0; border-radius:.7rem; background:#11131a; box-shadow:none; content-visibility:auto; contain-intrinsic-size:180px 180px; transform:none; }
+.listing.gallery .entry.image:hover { padding:0; transform:translateY(-2px); }
+.listing.gallery .entry.image::after { position:absolute; z-index:1; inset:auto 0 0; height:42%; background:linear-gradient(transparent,rgba(4,5,9,.78)); content:""; opacity:0; transition:opacity .18s ease; pointer-events:none; }
+.listing.gallery .entry.image .glyph { position:absolute; inset:0; width:100%; height:100%; border:0; border-radius:inherit; }
+.listing.gallery .entry.image .entry-name,.listing.gallery .entry.image .detail { position:absolute; z-index:2; right:.65rem; left:.65rem; color:#fff; opacity:0; transform:translateY(.3rem); transition:opacity .18s ease,transform .18s cubic-bezier(.16,1,.3,1); }
+.listing.gallery .entry.image .entry-name { bottom:1.55rem; }
+.listing.gallery .entry.image .detail { bottom:.55rem; justify-self:auto; font-size:.68rem; }
+.listing.gallery .entry.image:hover::after,.listing.gallery .entry.image:focus-visible::after,.listing.gallery .entry.image:hover .entry-name,.listing.gallery .entry.image:focus-visible .entry-name,.listing.gallery .entry.image:hover .detail,.listing.gallery .entry.image:focus-visible .detail { opacity:1; transform:none; }
+.listing.gallery .entry.file:not(.image) { order:2; }
+.listing.gallery .gallery-other-heading { display:block; grid-column:1/-1; order:1; margin:1.6rem .55rem .35rem; color:var(--muted); font-size:.78rem; font-weight:700; letter-spacing:.04em; }
+.listing.gallery .empty { order:3; }
 .delete-dialog { width:min(calc(100% - 2rem),26rem); padding:1.5rem; border:0; border-radius:1rem; color:var(--ink); background:var(--surface); box-shadow:0 24px 80px rgba(0,0,0,.35); }
 .delete-dialog::backdrop { background:rgba(10,12,20,.6); }
 .delete-dialog h2 { margin:0 0 1rem; font-size:1.3rem; }
@@ -3046,32 +4377,148 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .delete-actions #delete-confirm { border-color:transparent; color:#fff; background:#b42336; }
 .delete-actions #delete-confirm:hover { background:#941b2b; }
 .delete-actions button:disabled { opacity:.6; cursor:wait; }
-.image-lightbox { position:fixed; z-index:20; inset:0; display:grid; place-items:center; padding:clamp(1rem,4vw,3rem); background:rgba(10,12,20,.82); backdrop-filter:blur(10px); }
-.image-lightbox figure { display:grid; gap:.75rem; max-width:100%; max-height:100%; margin:0; padding:.75rem; overflow:auto; border:1px solid rgba(255,255,255,.2); border-radius:1rem; color:#fff; background:rgba(20,22,31,.96); box-shadow:0 30px 90px rgba(0,0,0,.45); }
-.image-lightbox img { display:block; max-width:min(90vw,1400px); max-height:calc(90vh - 4rem); max-height:calc(90dvh - 4rem); margin:auto; object-fit:contain; }
-.image-lightbox figcaption { display:flex; align-items:center; justify-content:center; gap:.75rem; min-width:0; padding:0 .25rem .15rem; font-size:.82rem; }
+.image-lightbox { position:fixed; z-index:20; inset:0; display:grid; place-items:center; padding:max(1rem,env(safe-area-inset-top)) max(1rem,env(safe-area-inset-right)) max(1rem,env(safe-area-inset-bottom)) max(1rem,env(safe-area-inset-left)); overflow:hidden; color:#fff; background:rgba(7,8,12,.92); backdrop-filter:blur(18px) saturate(115%); touch-action:none; user-select:none; }
+.lightbox-shell { display:grid; grid-template-rows:auto auto minmax(0,1fr); gap:.65rem; width:min(100%,1480px); height:100%; min-height:0; }
+.lightbox-position { color:rgba(255,255,255,.72); font:600 .76rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; font-variant-numeric:tabular-nums; letter-spacing:.04em; text-align:center; transition:opacity .22s ease,transform .3s cubic-bezier(.16,1,.3,1); }
+.lightbox-filmstrip { display:grid; grid-template-columns:repeat(7,3.5rem); justify-content:center; align-items:center; gap:.4rem; min-height:3.5rem; transition:opacity .22s ease,transform .3s cubic-bezier(.16,1,.3,1); }
+.filmstrip-slot { display:grid; place-items:center; width:3.5rem; height:3.5rem; }
+.filmstrip-thumb { display:grid; place-items:center; width:3rem; height:2.25rem; padding:0; overflow:hidden; border:1px solid rgba(255,255,255,.18); border-radius:.42rem; background:rgba(255,255,255,.07); box-shadow:0 4px 14px rgba(0,0,0,.22); cursor:pointer; opacity:.66; transform:scale(.94); transition:transform .2s cubic-bezier(.16,1,.3,1),opacity .16s ease,border-color .16s ease,box-shadow .2s ease; }
+.filmstrip-thumb img { display:block; width:100%; height:100%; object-fit:cover; }
+.filmstrip-thumb:hover { opacity:1; transform:scale(1); }
+.filmstrip-thumb[aria-current="true"] { width:3.5rem; height:2.75rem; border-color:rgba(255,255,255,.88); box-shadow:0 7px 20px rgba(0,0,0,.38); opacity:1; transform:scale(1); }
+.image-lightbox figure { position:relative; display:grid; grid-template-rows:minmax(0,1fr) auto auto auto; gap:.7rem; min-width:0; min-height:0; margin:0; }
+.lightbox-stage { position:relative; display:grid; place-items:center; min-width:0; min-height:0; overflow:hidden; contain:layout paint; }
+.carousel-backdrop { position:absolute; z-index:0; inset:-4%; display:none; background-position:center; background-size:cover; opacity:.66; filter:blur(12px) brightness(.4) saturate(1.06); transform:scale(1.08); pointer-events:none; }
+.lightbox-stage .lightbox-image { position:absolute; z-index:1; inset:0; display:block; width:100%; height:100%; object-fit:scale-down; filter:drop-shadow(0 18px 32px rgba(0,0,0,.32)); will-change:transform,opacity; transition:opacity .16s ease; }
+.lightbox-stage .lightbox-image.loading { opacity:0; }
+.lightbox-placeholder,.gesture-neighbour { position:absolute; z-index:1; inset:0; display:block; width:100%; height:100%; object-fit:contain; transform:translate3d(var(--gesture-x,0),var(--gesture-y,0),0); will-change:transform,opacity; }
+.lightbox-placeholder { opacity:1; filter:blur(7px) saturate(.9); transform:translate3d(var(--gesture-x,0),var(--gesture-y,0),0) scale(1.015); transition:opacity .2s ease; }
+.lightbox-placeholder.loaded { opacity:0; }
+.gesture-neighbour { z-index:2; filter:drop-shadow(0 18px 32px rgba(0,0,0,.25)); }
+.lightbox-state { position:absolute; z-index:4; display:flex; align-items:center; gap:.42rem; opacity:0; transform:translateY(.3rem); transition:opacity .2s ease,transform .3s cubic-bezier(.16,1,.3,1); pointer-events:none; }
+.lightbox-favourite-state { display:none; width:1.2rem; height:1.2rem; color:rgba(255,255,255,.92); filter:drop-shadow(0 2px 4px rgba(0,0,0,.6)); }
+.lightbox-favourite-state svg { display:block; width:100%; height:100%; }
+.lightbox-favourite-state path { fill:rgba(8,9,14,.28); stroke:currentColor; stroke-width:1.65; stroke-linejoin:round; }
+.lightbox-favourite-state.liked { display:block; color:#ff4f78; }
+.lightbox-favourite-state.liked path { fill:currentColor; stroke:rgba(255,255,255,.92); stroke-width:.75; }
+.lightbox-deletion-state { padding:.15rem .3rem; border-radius:.3rem; color:#fff; background:#b42336; box-shadow:0 2px 7px rgba(0,0,0,.3); font:700 .52rem/1.2 ui-sans-serif,-apple-system,sans-serif; white-space:nowrap; }
+.image-loading,.image-load-error { position:absolute; z-index:5; left:50%; bottom:1.25rem; display:flex; align-items:center; gap:.65rem; min-height:2.4rem; padding:.55rem .8rem; border-radius:.7rem; color:rgba(255,255,255,.9); background:rgba(16,18,25,.82); font-size:.75rem; transform:translateX(-50%); backdrop-filter:blur(12px); }
+.image-loading i { width:.9rem; height:.9rem; border:2px solid rgba(255,255,255,.25); border-top-color:#fff; border-radius:50%; animation:image-spin .7s linear infinite; }
+.image-load-error button { min-height:2rem; padding:.35rem .65rem; border:0; border-radius:.45rem; color:#11131a; background:#fff; font:650 .72rem/1 sans-serif; cursor:pointer; }
+@keyframes image-spin { to { transform:rotate(1turn); } }
+.heart-particles { position:absolute; z-index:8; inset:0; overflow:visible; pointer-events:none; }
+.heart-particles span { position:absolute; display:block; width:clamp(1rem,2.4vw,1.7rem); color:#ff4f78; filter:drop-shadow(0 5px 8px rgba(0,0,0,.3)); will-change:transform,opacity; }
+.heart-particles span[hidden] { display:none; }
+.heart-particles svg { display:block; width:100%; }
+.heart-particles path { fill:currentColor; stroke:rgba(255,255,255,.95); stroke-width:.65; }
+.heart-particles span.outline path { fill:rgba(20,22,31,.4); stroke:#ff9bb0; stroke-width:1.4; }
+.lightbox-stage .lightbox-image.preview-outgoing { position:absolute; inset:0; width:100%; height:100%; }
+.favourite-burst { position:absolute; z-index:2; inset:50% auto auto 50%; width:clamp(5rem,13vw,8rem); color:rgba(255,255,255,.92); pointer-events:none; transform:translate(-50%,-50%); filter:drop-shadow(0 12px 24px rgba(0,0,0,.3)); }
+.favourite-burst svg { display:block; width:100%; height:auto; overflow:visible; }
+.favourite-burst path { fill:rgba(12,13,18,.42); stroke:currentColor; stroke-width:1.4; stroke-linejoin:round; }
+.favourite-burst.liked { color:#ff4f78; }
+.favourite-burst.liked path { fill:currentColor; stroke:#fff; stroke-width:.7; }
+.image-lightbox figcaption { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:.65rem .75rem; min-width:0; padding:0 .25rem .15rem; font-size:.82rem; transition:opacity .22s ease,transform .3s cubic-bezier(.16,1,.3,1); }
 .lightbox-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .lightbox-controls { display:flex; flex-shrink:0; align-items:center; gap:.4rem; }
-.preview-step,.deletion-toggle { display:grid; place-items:center; min-width:2.15rem; height:2.15rem; padding:0 .55rem; border:1px solid rgba(255,255,255,.3); border-radius:1.1rem; color:#fff; background:transparent; font:650 .72rem/1 sans-serif; cursor:pointer; }
-.preview-step { width:2.15rem; padding:0; font-size:1rem; }
-.preview-step:hover,.deletion-toggle:hover { background:rgba(255,255,255,.1); }
-.preview-step:disabled,.deletion-toggle:disabled { opacity:.35; cursor:default; }
+.preview-step,.deletion-toggle,.carousel-toggle,.comment-toggle,.viewer-more-toggle,.viewer-tools button,.shortcut-help-toggle { position:relative; display:grid; place-items:center; min-width:2.75rem; height:2.75rem; padding:0 .7rem; border:1px solid rgba(255,255,255,.26); border-radius:.8rem; color:#fff; background:rgba(255,255,255,.045); font:650 .72rem/1 sans-serif; cursor:pointer; transition:background .18s ease,border-color .18s ease,transform .18s cubic-bezier(.16,1,.3,1); }
+.preview-step,.deletion-toggle,.carousel-toggle,.comment-toggle,.viewer-more-toggle { width:2.75rem; padding:0; }
+.preview-step svg,.deletion-toggle svg,.carousel-toggle svg,.comment-toggle svg,.viewer-more-toggle svg,.viewer-tools svg,.shortcut-help-toggle svg,.lightbox-close svg,.gallery-comments button svg { width:1.15rem; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+.carousel-toggle .icon-fill { fill:currentColor; stroke:none; }
+.preview-step:hover,.deletion-toggle:hover,.carousel-toggle:hover,.comment-toggle:hover,.viewer-more-toggle:hover,.viewer-tools button:hover,.shortcut-help-toggle:hover { background:rgba(255,255,255,.12); transform:translateY(-1px); }
+.preview-step:disabled,.deletion-toggle:disabled,.carousel-toggle:disabled { opacity:.35; cursor:default; }
 .deletion-toggle[aria-pressed="true"] { border-color:#ff9ba9; color:#fff; background:#b42336; }
-.favourite-toggle { flex-shrink:0; display:grid; place-items:center; width:2.75rem; height:2.75rem; padding:0; border:1px solid rgba(255,255,255,.3); border-radius:50%; color:#fff; background:transparent; font:1.65rem/1 sans-serif; cursor:pointer; }
+.carousel-toggle[aria-pressed="true"] { border-color:rgba(255,255,255,.82); background:rgba(255,255,255,.16); }
+.comment-toggle[aria-expanded="true"] { border-color:#b9b5ff; color:#d5d2ff; background:rgba(91,91,214,.25); }
+.comment-toggle b { position:absolute; top:-.35rem; right:-.35rem; display:grid; place-items:center; min-width:1.15rem; height:1.15rem; padding:0 .25rem; border:2px solid #11131a; border-radius:999px; color:#11131a; background:#d5d2ff; font:750 .6rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.viewer-more-toggle svg { transition:transform .24s cubic-bezier(.16,1,.3,1); }
+.viewer-more-toggle.open svg { transform:rotate(180deg); }
+.favourite-toggle { flex-shrink:0; display:grid; place-items:center; width:3rem; height:3rem; padding:0; border:1px solid rgba(255,255,255,.3); border-radius:50%; color:#fff; background:rgba(255,255,255,.045); cursor:pointer; }
+.favourite-toggle svg { width:1.5rem; fill:transparent; stroke:currentColor; stroke-width:1.45; transition:fill .18s ease,color .18s ease; }
 .favourite-toggle:hover { background:rgba(255,255,255,.1); }
 .favourite-toggle[aria-pressed="true"] { color:#ff6685; }
+.favourite-toggle[aria-pressed="true"] svg { fill:currentColor; }
 .favourite-toggle:disabled { opacity:.5; cursor:wait; }
 .lightbox-error { margin:0; color:#ff9ba9; font-size:.82rem; text-align:center; }
-.lightbox-close { position:fixed; z-index:1; top:max(1rem,env(safe-area-inset-top)); right:max(1rem,env(safe-area-inset-right)); display:grid; place-items:center; width:2.75rem; height:2.75rem; padding:0; border:1px solid rgba(255,255,255,.3); border-radius:50%; color:#fff; background:rgba(20,22,31,.78); font:300 1.8rem/1 sans-serif; cursor:pointer; }
-.lightbox-close:hover { background:rgba(91,91,214,.95); }
+.lightbox-close { position:fixed; z-index:9; top:max(1rem,env(safe-area-inset-top)); right:max(1rem,env(safe-area-inset-right)); display:grid; place-items:center; width:2.75rem; height:2.75rem; padding:0; border:0; color:rgba(255,255,255,.78); background:transparent; cursor:pointer; transition:color .18s ease,opacity .22s ease,transform .3s cubic-bezier(.16,1,.3,1); }
+.lightbox-close svg { width:1.35rem; }
+.lightbox-close:hover { color:#fff; transform:scale(1.08); }
+.viewer-extras { flex-basis:100%; display:flex; justify-content:center; align-items:center; gap:.35rem; animation:viewer-extras-in .24s cubic-bezier(.16,1,.3,1); }
+@keyframes viewer-extras-in { from { opacity:0; transform:translateY(-.35rem); } }
+.viewer-tools { display:flex; gap:.3rem; }
+.viewer-tools button[data-view="fit"],.viewer-tools button[data-view="actual"] { min-width:3.2rem; }
+.image-info,.shortcut-help { position:absolute; z-index:7; right:.5rem; bottom:4.2rem; display:flex; flex-wrap:wrap; align-items:center; gap:.65rem; max-width:min(92vw,36rem); padding:.75rem .9rem; border:1px solid rgba(255,255,255,.16); border-radius:.8rem; color:rgba(255,255,255,.82); background:rgba(14,16,23,.88); box-shadow:0 14px 44px rgba(0,0,0,.3); backdrop-filter:blur(16px); font-size:.72rem; }
+.image-info a { color:#fff; text-underline-offset:.2em; }
+.shortcut-help { left:50%; right:auto; justify-content:center; transform:translateX(-50%); }
+.gallery-comments { position:fixed; z-index:12; top:max(1rem,env(safe-area-inset-top)); right:max(1rem,env(safe-area-inset-right)); bottom:max(1rem,env(safe-area-inset-bottom)); display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:auto auto minmax(0,1fr) auto auto; width:min(25rem,calc(100vw - 2rem)); overflow:hidden; border:1px solid rgba(255,255,255,.18); border-radius:1.1rem; color:#f5f5fa; background:rgba(17,19,27,.96); box-shadow:0 28px 90px rgba(0,0,0,.52); backdrop-filter:blur(24px) saturate(125%); animation:gallery-comments-in .34s cubic-bezier(.16,1,.3,1); }
+@keyframes gallery-comments-in { from { opacity:0; transform:translateX(1.5rem) scale(.985); } }
+.gallery-comments>header { grid-area:1/1; display:flex; align-items:center; justify-content:space-between; padding:1.1rem 1.15rem .9rem; border-bottom:1px solid rgba(255,255,255,.1); }
+.gallery-comments>header div { display:grid; gap:.25rem; }
+.gallery-comments>header span { color:#aaa6ff; font:750 .62rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.13em; }
+.gallery-comments>header strong { font:700 1rem/1.2 ui-sans-serif,-apple-system,sans-serif; }
+.gallery-comments>header button { display:grid; place-items:center; width:2.5rem; height:2.5rem; padding:0; border:1px solid rgba(255,255,255,.14); border-radius:.75rem; color:#fff; background:transparent; cursor:pointer; }
+.gallery-comments-image { grid-area:2/1; display:grid; grid-template-columns:3.4rem minmax(0,1fr) auto; align-items:center; gap:.8rem; padding:.85rem 1.15rem; border-bottom:1px solid rgba(255,255,255,.08); background:rgba(255,255,255,.025); }
+.gallery-comments-image img { width:3.4rem; height:3.4rem; border-radius:.65rem; object-fit:cover; background:#090a0f; }
+.gallery-comments-image div { display:grid; min-width:0; gap:.3rem; }
+.gallery-comments-image strong { overflow:hidden; font-size:.82rem; text-overflow:ellipsis; white-space:nowrap; }
+.gallery-comments-image span { color:rgba(255,255,255,.55); font-size:.7rem; }
+.gallery-comments-image [data-comment-delete-all] { padding:.4rem 0; border:0; color:rgba(255,143,162,.78); background:transparent; font:650 .66rem/1.2 sans-serif; cursor:pointer; }
+.gallery-comments-image [data-comment-delete-all]:hover,.gallery-comments-image [data-comment-delete-all][data-confirm="true"] { color:#ff9bae; }
+.gallery-comments-image [data-comment-delete-all]:disabled { opacity:.45; cursor:wait; }
+.gallery-comment-list { grid-area:3/1; min-height:0; overflow:auto; padding:0 1.15rem; overscroll-behavior:contain; scrollbar-color:rgba(255,255,255,.24) transparent; }
+.gallery-comment-list article { padding:1rem 0; border-bottom:1px solid rgba(255,255,255,.09); }
+.gallery-comment-list article>header { display:flex; align-items:baseline; justify-content:space-between; gap:.75rem; }
+.gallery-comment-list article strong { color:#fff; font-size:.76rem; }
+.gallery-comment-list article time { color:rgba(255,255,255,.42); font:500 .62rem/1.3 ui-monospace,SFMono-Regular,Consolas,monospace; text-align:right; }
+.gallery-comment-list article p { margin:.55rem 0 .7rem; color:rgba(255,255,255,.8); font-size:.82rem; line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }
+.gallery-comment-list article>div { display:flex; gap:.75rem; }
+.gallery-comment-list article button,.gallery-comment-composer [data-comment-cancel] { padding:0; border:0; color:rgba(255,255,255,.5); background:transparent; font:650 .68rem/1 sans-serif; cursor:pointer; }
+.gallery-comment-list article button:hover,.gallery-comment-composer [data-comment-cancel]:hover { color:#fff; }
+.gallery-comment-list [data-comment-delete][data-confirm="true"] { color:#ff8fa2; }
+.gallery-comment-empty { grid-area:3/1; place-self:center; display:grid; justify-items:center; gap:.4rem; padding:2rem; color:rgba(255,255,255,.5); text-align:center; pointer-events:none; }
+.gallery-comment-empty strong { color:rgba(255,255,255,.78); font-size:.86rem; }
+.gallery-comment-empty span { max-width:18rem; font-size:.72rem; line-height:1.55; }
+.gallery-comments.loading .gallery-comment-empty { display:none; }
+.gallery-comment-composer { grid-area:4/1; min-height:0; max-height:min(52dvh,23rem); display:grid; gap:.7rem; overflow-y:auto; padding:1rem 1.15rem; border-top:1px solid rgba(255,255,255,.1); background:rgba(8,9,14,.46); overscroll-behavior:contain; scrollbar-color:rgba(255,255,255,.24) transparent; }
+.gallery-comment-identity { display:flex; align-items:center; justify-content:space-between; gap:.75rem; color:rgba(255,255,255,.52); font:650 .68rem/1.3 sans-serif; }
+.gallery-comment-identity strong { color:rgba(255,255,255,.9); }
+.gallery-comment-identity button { padding:.25rem 0; border:0; color:#b9b5ff; background:transparent; font:650 .68rem/1 sans-serif; cursor:pointer; }
+.gallery-comment-composer label { display:grid; gap:.35rem; color:rgba(255,255,255,.5); font:650 .65rem/1 sans-serif; }
+.gallery-comment-composer input,.gallery-comment-composer textarea { width:100%; border:1px solid rgba(255,255,255,.14); border-radius:.7rem; color:#fff; background:rgba(255,255,255,.055); font:500 .8rem/1.55 ui-sans-serif,-apple-system,"Noto Sans SC",sans-serif; caret-color:#b9b5ff; outline:none; }
+.gallery-comment-composer input { height:2.5rem; padding:0 .75rem; }
+.gallery-comment-composer textarea { min-height:5.7rem; max-height:12rem; padding:.65rem .75rem; resize:vertical; }
+.gallery-comment-composer input:focus,.gallery-comment-composer textarea:focus { border-color:#aaa6ff; box-shadow:0 0 0 3px rgba(170,166,255,.12); }
+.gallery-comment-hint { margin:-.25rem 0 0; color:rgba(255,255,255,.38); font:600 .64rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.gallery-comment-composer>div { display:flex; align-items:center; justify-content:flex-end; gap:.9rem; }
+.gallery-comment-composer .comment-submit { min-height:2.5rem; padding:.65rem 1rem; border:0; border-radius:.7rem; color:#11131a; background:#d5d2ff; font:750 .72rem/1 sans-serif; cursor:pointer; }
+.gallery-comment-composer .comment-submit:disabled { opacity:.55; cursor:wait; }
+.gallery-comment-error { margin:0; color:#ff9bad; font-size:.7rem; }
+.gallery-comments>footer { grid-area:5/1; display:flex; align-items:center; justify-content:space-between; gap:.75rem; padding:.7rem 1.15rem; border-top:1px solid rgba(255,255,255,.08); color:rgba(255,255,255,.35); font:550 .62rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.gallery-comments>footer a { color:#aaa6ff; text-underline-offset:.2em; }
+.carousel-hud { position:fixed; z-index:10; left:50%; bottom:max(1.25rem,env(safe-area-inset-bottom)); display:none; gap:.45rem; transform:translateX(-50%); transition:opacity .22s ease,transform .3s cubic-bezier(.16,1,.3,1); }
+.carousel-hud button { min-height:2.75rem; padding:.65rem .9rem; border:1px solid rgba(255,255,255,.25); border-radius:.75rem; color:#fff; background:rgba(12,14,20,.72); backdrop-filter:blur(12px); cursor:pointer; }
+.carousel-notice { align-self:center; padding:.55rem .7rem; border-radius:.65rem; color:rgba(255,255,255,.78); background:rgba(12,14,20,.72); font-size:.72rem; backdrop-filter:blur(12px); }
+.image-lightbox.chrome-hidden figcaption { opacity:0; pointer-events:none; transform:translateY(.55rem); }
+.image-lightbox:not(.carousel-mode) .lightbox-state { opacity:1; transform:none; }
+.image-lightbox.carousel-mode { padding:0; background:#000; backdrop-filter:none; }
+.image-lightbox:fullscreen { width:100vw; height:100vh; height:100dvh; inset:0; }
+.image-lightbox:-webkit-full-screen { width:100vw; height:100vh; height:100dvh; inset:0; }
+.image-lightbox.carousel-mode .lightbox-close,.image-lightbox.carousel-mode .lightbox-position,.image-lightbox.carousel-mode .lightbox-filmstrip,.image-lightbox.carousel-mode figcaption,.image-lightbox.carousel-mode .lightbox-state,.image-lightbox.carousel-mode .lightbox-error,.image-lightbox.carousel-mode .image-info,.image-lightbox.carousel-mode .shortcut-help,.image-lightbox.carousel-mode .gallery-comments { display:none; }
+.image-lightbox.carousel-mode .carousel-hud { display:flex; }
+.image-lightbox.carousel-mode .lightbox-shell { grid-template-rows:minmax(0,1fr); width:100%; height:100%; }
+.image-lightbox.carousel-mode figure { grid-template-rows:minmax(0,1fr); }
+.image-lightbox.carousel-mode .carousel-backdrop { display:block; }
+.image-lightbox.carousel-mode .lightbox-stage .lightbox-image,.image-lightbox.carousel-mode .lightbox-placeholder { width:100%; height:100%; max-width:100vw; max-height:100vh; max-height:100dvh; object-fit:contain; filter:none; }
 .empty { display:grid; grid-column:1/-1; place-items:center; min-height:14rem; color:var(--muted); }
 .empty span { font:300 3rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .empty p { margin:.8rem 0 0; }
 :focus-visible { outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent); outline-offset:-3px; }
-@media (max-width:650px) { main,.gallery-mode main { width:100%; padding:1rem; } header { padding:1.5rem 1.1rem; } .view-toggle { position:relative; right:auto; top:auto; width:max-content; margin-top:1rem; } .entry { grid-template-columns:2.4rem minmax(0,1fr) auto; padding-inline:1rem; } .kind,.arrow { display:none; } .detail { grid-column:3; } .entry.image .glyph { width:2.4rem; height:2.4rem; } .listing.gallery { grid-template-columns:repeat(auto-fill,minmax(145px,1fr)); gap:.65rem; padding:.65rem; } .gallery .entry { grid-template-columns:minmax(0,1fr); grid-template-rows:8.5rem auto auto; padding:.6rem; } .gallery .entry:hover { padding:.6rem; } .gallery .entry.image .glyph { width:100%; height:100%; } .gallery .detail { grid-column:1; grid-row:3; justify-self:start; } .image-lightbox figcaption { flex-wrap:wrap; } .lightbox-name { width:100%; text-align:center; } }
-@media (hover:none) and (pointer:coarse) { .image-lightbox,.image-lightbox figure { touch-action:pan-x pinch-zoom; } .image-lightbox img { -webkit-touch-callout:none; user-select:none; } }
+@media (max-width:650px) { main,.gallery-mode main { width:100%; padding:1rem; } main>header { padding:1.5rem 1.1rem; } .view-toggle { position:relative; right:auto; top:auto; width:max-content; margin-top:1rem; } .entry { grid-template-columns:2.4rem minmax(0,1fr) auto; padding-inline:1rem; } .kind,.arrow { display:none; } .detail { grid-column:3; } .entry.image .glyph { width:2.4rem; height:2.4rem; } .listing.gallery { grid-template-columns:repeat(auto-fill,minmax(145px,1fr)); gap:.65rem; padding:.65rem; } .gallery .entry { grid-template-columns:minmax(0,1fr); grid-template-rows:8.5rem auto auto; padding:.6rem; } .gallery .entry:hover { padding:.6rem; } .gallery .entry.image .glyph { width:100%; height:100%; } .gallery .detail { grid-column:1; grid-row:3; justify-self:start; } .scroll-jumps { right:max(.4rem,env(safe-area-inset-right)); } .scroll-jumps button { width:2.8rem; height:2.8rem; } .image-lightbox { padding:max(.7rem,env(safe-area-inset-top)) max(.7rem,env(safe-area-inset-right)) max(.7rem,env(safe-area-inset-bottom)) max(.7rem,env(safe-area-inset-left)); } .lightbox-shell { gap:.45rem; } .lightbox-filmstrip { grid-template-columns:repeat(5,3.35rem); gap:.25rem; } .filmstrip-slot { width:3.35rem; } .filmstrip-slot[data-distance="3"] { display:none; } .image-lightbox figcaption { flex-wrap:wrap; } .lightbox-name { width:100%; text-align:center; } .lightbox-controls { gap:.25rem; } .preview-step,.deletion-toggle,.carousel-toggle,.comment-toggle,.viewer-more-toggle { min-width:2.8rem; width:2.8rem; height:2.8rem; } .favourite-toggle { width:2.9rem; height:2.9rem; } .gallery-comments { inset:auto max(.45rem,env(safe-area-inset-right)) max(.45rem,env(safe-area-inset-bottom)) max(.45rem,env(safe-area-inset-left)); width:auto; height:min(92dvh,42rem); border-radius:1.15rem; animation-name:gallery-comments-mobile-in; } @keyframes gallery-comments-mobile-in { from { opacity:0; transform:translateY(1.5rem) scale(.985); } } .gallery-comment-composer textarea { min-height:4.8rem; } }
+@media (max-height:620px) { .gallery-comments>header { padding:.7rem .9rem .6rem; } .gallery-comments>header button { width:2.15rem; height:2.15rem; } .gallery-comments-image { grid-template-columns:2.7rem minmax(0,1fr) auto; gap:.65rem; padding:.55rem .9rem; } .gallery-comments-image img { width:2.7rem; height:2.7rem; } .gallery-comment-empty { gap:.25rem; padding:.75rem; } .gallery-comment-composer { max-height:58dvh; gap:.5rem; padding:.7rem .9rem; } .gallery-comment-composer textarea { min-height:4rem; } .gallery-comments>footer { display:none; } }
+@media (max-width:1024px),(hover:none) and (pointer:coarse) { .preview-step,.deletion-toggle,.carousel-toggle,.comment-toggle,.viewer-more-toggle,.viewer-tools button,.shortcut-help-toggle { min-width:3rem; height:3rem; } .lightbox-controls { width:100%; min-width:0; flex-shrink:1; justify-content:center; flex-wrap:wrap; } .viewer-extras,.viewer-tools { width:100%; justify-content:center; border:0; } .image-info,.shortcut-help { left:50%; right:auto; bottom:8.7rem; width:max-content; max-width:calc(100vw - 2rem); transform:translateX(-50%); } }
+@media (hover:none) and (pointer:coarse) { .listing.gallery .entry.image,.listing.gallery .entry.image:hover { display:block; padding:0; } .listing.gallery .entry.image::after,.listing.gallery .entry.image .entry-name,.listing.gallery .entry.image .detail { opacity:1; transform:none; } .image-lightbox figcaption { padding-bottom:max(.2rem,env(safe-area-inset-bottom)); } }
 @media (prefers-color-scheme:dark) { :root { --paper:#11131b; --surface:#191c27; --ink:#edf0f7; --muted:#a7adbd; --line:#303545; --accent:#a9a5ff; --accent-soft:#292943; --folder:#8e8af5; --grid:#262b38; } body { background-image:radial-gradient(circle at 50% -20%,#252943 0,transparent 38rem); } .listing { box-shadow:0 25px 70px rgba(0,0,0,.25); } }
-@media (prefers-reduced-motion:reduce) { .entry,.arrow,.entry.image .glyph img { transition:none; } .entry.image:hover .glyph img,.gallery .entry:hover { transform:none; } }
+@media (prefers-reduced-motion:reduce) { .entry,.arrow,.entry.image .glyph img,.filmstrip-thumb { transition:none; } .entry.image:hover .glyph img,.gallery .entry:hover,.filmstrip-thumb { transform:none; } }
 "#;
 
 const MARKDOWN_CSS: &str = r#"
@@ -4352,6 +5799,24 @@ fn mime_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_http_request(
+        address: std::net::SocketAddr,
+        method: &str,
+        target: &str,
+        body: &str,
+    ) -> String {
+        let mut client = TcpStream::connect(address).unwrap();
+        write!(
+            client,
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    }
+
     #[test]
     fn parses_default_and_custom_ports() {
         assert_eq!(
@@ -4498,8 +5963,7 @@ mod tests {
                 &ReviewHub::default(),
                 false,
                 cache.as_ref(),
-                &Favourites::new(None).unwrap(),
-                &DeletionMarks::new(None).unwrap(),
+                &StateStore::new(None).unwrap(),
             )
             .unwrap();
         });
@@ -4542,7 +6006,7 @@ mod tests {
                 .set_times(fs::FileTimes::new().set_modified(original_time))
                 .unwrap();
         };
-        for mode in ["thumb", "gallery-thumb", "asset"] {
+        for mode in ["thumb", "gallery-thumb", "gallery-preview", "asset"] {
             write_image([240, 20, 30]);
             let (headers, first) = image_request(directory.path(), Some(&cache), "GET", mode, "");
             assert!(headers.starts_with("HTTP/1.1 200"));
@@ -4585,13 +6049,31 @@ mod tests {
         image::RgbImage::from_pixel(32, 32, image::Rgb([20, 40, 60]))
             .save(directory.path().join("photo.png"))
             .unwrap();
-        for mode in ["thumb", "gallery-thumb", "asset"] {
+        for mode in ["thumb", "gallery-thumb", "gallery-preview", "asset"] {
             let (headers, body) = image_request(directory.path(), None, "GET", mode, "*");
             assert!(headers.starts_with("HTTP/1.1 200"));
             assert!(headers.contains("Cache-Control: no-store\r\n"));
             image::load_from_memory(&body).unwrap();
         }
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn versioned_image_requests_use_immutable_browser_caching() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("photo.png");
+        image::RgbImage::from_pixel(32, 32, image::Rgb([20, 40, 60]))
+            .save(&path)
+            .unwrap();
+        let cache = ImageCache::new(&directory.path().join("cache")).unwrap();
+        let version = file_version(&fs::metadata(&path).unwrap());
+
+        for mode in ["thumb", "gallery-thumb", "gallery-preview", "asset"] {
+            let mode = format!("{mode}&v={version}");
+            let (headers, _) = image_request(directory.path(), Some(&cache), "GET", &mode, "");
+            assert!(headers.starts_with("HTTP/1.1 200"));
+            assert!(headers.contains("Cache-Control: private, max-age=31536000, immutable\r\n"));
+        }
     }
 
     #[test]
@@ -4614,8 +6096,7 @@ mod tests {
                     &reviews,
                     true,
                     None,
-                    &Favourites::new(None).unwrap(),
-                    &DeletionMarks::new(None).unwrap(),
+                    &StateStore::new(None).unwrap(),
                 )
                 .unwrap();
             }
@@ -4852,8 +6333,7 @@ mod tests {
                 &reviews,
                 false,
                 None,
-                &Favourites::new(None).unwrap(),
-                &DeletionMarks::new(None).unwrap(),
+                &StateStore::new(None).unwrap(),
             )
             .unwrap();
         });
@@ -4982,8 +6462,7 @@ mod tests {
                     &reviews,
                     false,
                     None,
-                    &Favourites::new(None).unwrap(),
-                    &DeletionMarks::new(None).unwrap(),
+                    &StateStore::new(None).unwrap(),
                 )
                 .unwrap();
             }
@@ -5018,12 +6497,11 @@ mod tests {
         fs::write(directory.path().join("notes.txt"), "keep").unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
         let marked_path = root.join("cat.svg");
-        let deletion_marks = DeletionMarks::new(None).unwrap();
-        let server_marks = deletion_marks.clone();
+        let state = StateStore::new(None).unwrap();
+        let server_state = state.clone();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let favourites = Favourites::new(None).unwrap();
             for _ in 0..3 {
                 let (stream, _) = listener.accept().unwrap();
                 handle_connection(
@@ -5033,8 +6511,7 @@ mod tests {
                     &ReviewHub::default(),
                     false,
                     None,
-                    &favourites,
-                    &server_marks,
+                    &server_state,
                 )
                 .unwrap();
             }
@@ -5063,7 +6540,7 @@ mod tests {
         assert!(!directory.path().join("cat.svg").exists());
         assert!(directory.path().join("dog.svg").exists());
         assert!(directory.path().join("notes.txt").exists());
-        assert!(!deletion_marks.contains(&marked_path).unwrap());
+        assert!(!state.is_deletion_marked(&marked_path).unwrap());
     }
 
     #[test]
@@ -5075,16 +6552,16 @@ mod tests {
         let root = fs::canonicalize(directory.path()).unwrap();
         let cat = root.join("cat.svg");
         let dog = root.join("nested/dog.svg");
-        let deletion_marks = DeletionMarks::new(None).unwrap();
-        deletion_marks.set(&cat, true).unwrap();
-        deletion_marks.set(&dog, true).unwrap();
+        let state = StateStore::new(None).unwrap();
+        state.set_deletion_mark(&cat, true).unwrap();
+        state.set_deletion_mark(&dog, true).unwrap();
 
-        let result = clear_directory_deletion_marks(&root, &deletion_marks).unwrap();
+        let result = clear_directory_deletion_marks(&root, &state).unwrap();
 
         assert_eq!(result.cleared, 1);
         assert!(result.errors.is_empty());
-        assert!(!deletion_marks.contains(&cat).unwrap());
-        assert!(deletion_marks.contains(&dog).unwrap());
+        assert!(!state.is_deletion_marked(&cat).unwrap());
+        assert!(state.is_deletion_marked(&dog).unwrap());
         assert!(cat.exists());
         assert!(dog.exists());
     }
@@ -5095,89 +6572,223 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = fs::canonicalize(directory.path()).unwrap();
             let cache = tempfile::tempdir().unwrap();
-            let favourites = Favourites::new(disk.then_some(cache.path())).unwrap();
-            let deletion_marks = DeletionMarks::new(disk.then_some(cache.path())).unwrap();
+            let state = StateStore::new(disk.then_some(cache.path())).unwrap();
             fs::write(root.join("liked 猫.svg"), "<svg>liked</svg>").unwrap();
             fs::write(root.join("other.svg"), "<svg>other</svg>").unwrap();
             fs::write(root.join("notes.txt"), "notes").unwrap();
             fs::create_dir(root.join("nested")).unwrap();
             fs::write(root.join("nested/photo.svg"), "<svg>nested</svg>").unwrap();
-            favourites.set(&root.join("liked 猫.svg"), true).unwrap();
-            deletion_marks.set(&root.join("other.svg"), true).unwrap();
+            state
+                .set_favourite(&root.join("liked 猫.svg"), true)
+                .unwrap();
+            state
+                .set_deletion_mark(&root.join("liked 猫.svg"), true)
+                .unwrap();
+            state
+                .set_deletion_mark(&root.join("other.svg"), true)
+                .unwrap();
 
-            let result =
-                move_directory_images(&root, &favourites, &deletion_marks, "favourites").unwrap();
+            let result = move_favourite_images(&root, &state).unwrap();
             assert_eq!(result.moved, 1);
             assert!(result.errors.is_empty());
             assert_eq!(
                 fs::read_to_string(root.join("favourites/liked 猫.svg")).unwrap(),
                 "<svg>liked</svg>"
             );
-            assert!(favourites
-                .contains(&root.join("favourites/liked 猫.svg"))
+            assert!(state
+                .is_favourite(&root.join("favourites/liked 猫.svg"))
                 .unwrap());
-            assert!(!favourites.contains(&root.join("liked 猫.svg")).unwrap());
+            assert!(!state.is_favourite(&root.join("liked 猫.svg")).unwrap());
+            assert!(state
+                .is_deletion_marked(&root.join("favourites/liked 猫.svg"))
+                .unwrap());
+            assert!(!state
+                .is_deletion_marked(&root.join("liked 猫.svg"))
+                .unwrap());
 
-            let result =
-                move_directory_images(&root, &favourites, &deletion_marks, "unpopular").unwrap();
-            assert_eq!(result.moved, 1);
-            assert!(result.errors.is_empty());
             assert_eq!(
-                fs::read_to_string(root.join("unpopular/other.svg")).unwrap(),
+                fs::read_to_string(root.join("other.svg")).unwrap(),
                 "<svg>other</svg>"
             );
-            assert!(!favourites
-                .contains(&root.join("unpopular/other.svg"))
-                .unwrap());
-            assert!(deletion_marks
-                .contains(&root.join("unpopular/other.svg"))
-                .unwrap());
-            assert!(!deletion_marks.contains(&root.join("other.svg")).unwrap());
+            assert!(state.is_deletion_marked(&root.join("other.svg")).unwrap());
             assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "notes");
             assert_eq!(
                 fs::read_to_string(root.join("nested/photo.svg")).unwrap(),
                 "<svg>nested</svg>"
             );
             if disk {
-                let reopened = Favourites::new(Some(cache.path())).unwrap();
+                let reopened = StateStore::new(Some(cache.path())).unwrap();
                 assert!(reopened
-                    .contains(&root.join("favourites/liked 猫.svg"))
+                    .is_favourite(&root.join("favourites/liked 猫.svg"))
                     .unwrap());
-                assert!(!reopened.contains(&root.join("liked 猫.svg")).unwrap());
+                assert!(!reopened.is_favourite(&root.join("liked 猫.svg")).unwrap());
             }
         }
     }
 
     #[test]
-    fn organising_images_skips_existing_destinations_and_moves_the_rest() {
+    fn organising_images_renames_destination_conflicts() {
         let directory = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
-        let favourites = Favourites::new(None).unwrap();
-        let deletion_marks = DeletionMarks::new(None).unwrap();
+        let state = StateStore::new(None).unwrap();
         fs::create_dir(root.join("favourites")).unwrap();
         fs::write(root.join("favourites/cat.svg"), "existing image").unwrap();
+        fs::write(root.join("favourites/cat_2.svg"), "second image").unwrap();
         fs::write(root.join("cat.svg"), "new image").unwrap();
         fs::write(root.join("dog.svg"), "another image").unwrap();
-        favourites.set(&root.join("cat.svg"), true).unwrap();
-        favourites.set(&root.join("dog.svg"), true).unwrap();
+        state.set_favourite(&root.join("cat.svg"), true).unwrap();
+        state.set_favourite(&root.join("dog.svg"), true).unwrap();
 
-        let result =
-            move_directory_images(&root, &favourites, &deletion_marks, "favourites").unwrap();
-        assert_eq!(result.moved, 1);
-        assert_eq!(result.skipped, 1);
+        let result = move_favourite_images(&root, &state).unwrap();
+        assert_eq!(result.moved, 2);
         assert!(result.errors.is_empty());
         assert_eq!(
             fs::read_to_string(root.join("favourites/cat.svg")).unwrap(),
             "existing image"
         );
         assert_eq!(
-            fs::read_to_string(root.join("cat.svg")).unwrap(),
+            fs::read_to_string(root.join("favourites/cat_2.svg")).unwrap(),
+            "second image"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("favourites/cat_3.svg")).unwrap(),
             "new image"
         );
-        assert!(favourites.contains(&root.join("cat.svg")).unwrap());
-        assert!(favourites
-            .contains(&root.join("favourites/dog.svg"))
+        assert!(!root.join("cat.svg").exists());
+        assert!(state
+            .is_favourite(&root.join("favourites/cat_3.svg"))
             .unwrap());
+        assert!(state
+            .is_favourite(&root.join("favourites/dog.svg"))
+            .unwrap());
+    }
+
+    #[test]
+    fn gallery_comment_endpoint_shares_edits_and_deletes_across_images() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("first.svg"), "<svg>first</svg>").unwrap();
+        fs::write(directory.path().join("second.svg"), "<svg>second</svg>").unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let state = StateStore::new(None).unwrap();
+            for _ in 0..8 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection(
+                    stream,
+                    &root,
+                    &CollaborationHub::default(),
+                    &ReviewHub::default(),
+                    false,
+                    None,
+                    &state,
+                )
+                .unwrap();
+            }
+        });
+        let body = |response: String| response.split_once("\r\n\r\n").unwrap().1.to_owned();
+
+        let empty = test_http_request(address, "GET", "/first.svg?mode=gallery-comments", "");
+        assert!(empty.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body(empty)).unwrap()["comments"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let add = serde_json::json!({
+            "type": "add",
+            "comment": {
+                "id": "one",
+                "image": "first.svg",
+                "author": "Alice",
+                "body": "降低背景亮度",
+                "created_at": "2026-09-09T10:00:00.000Z"
+            }
+        })
+        .to_string();
+        assert!(
+            test_http_request(address, "POST", "/first.svg?mode=gallery-comments", &add)
+                .starts_with("HTTP/1.1 200 OK")
+        );
+
+        let shared = body(test_http_request(
+            address,
+            "GET",
+            "/second.svg?mode=gallery-comments",
+            "",
+        ));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&shared).unwrap()["comments"][0]["image"],
+            "first.svg"
+        );
+
+        let edit = serde_json::json!({
+            "type": "edit",
+            "comment_id": "one",
+            "body": "降低背景高光",
+            "edited_at": "2026-09-09T11:00:00.000Z"
+        })
+        .to_string();
+        let edited = body(test_http_request(
+            address,
+            "POST",
+            "/second.svg?mode=gallery-comments",
+            &edit,
+        ));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&edited).unwrap()["comments"][0]["body"],
+            "降低背景高光"
+        );
+
+        let add_second = serde_json::json!({
+            "type": "add",
+            "comment": {
+                "id": "two",
+                "image": "second.svg",
+                "author": "Alice",
+                "body": "保留这条评论",
+                "created_at": "2026-09-09T12:00:00.000Z"
+            }
+        })
+        .to_string();
+        assert!(test_http_request(
+            address,
+            "POST",
+            "/second.svg?mode=gallery-comments",
+            &add_second
+        )
+        .starts_with("HTTP/1.1 200 OK"));
+
+        let cleared = body(test_http_request(
+            address,
+            "POST",
+            "/first.svg?mode=gallery-comments",
+            r#"{"type":"delete-all"}"#,
+        ));
+        let cleared = serde_json::from_str::<serde_json::Value>(&cleared).unwrap();
+        assert_eq!(cleared["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(cleared["comments"][0]["image"], "second.svg");
+
+        let delete = serde_json::json!({"type": "delete", "comment_id": "two"}).to_string();
+        let deleted = body(test_http_request(
+            address,
+            "POST",
+            "/second.svg?mode=gallery-comments",
+            &delete,
+        ));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&deleted).unwrap()["comments"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let listing = test_http_request(address, "GET", "/?view=gallery", "");
+        assert!(!body(listing).contains("href=\"/.gallery-comments.json\""));
+        server.join().unwrap();
     }
 
     #[test]
@@ -5189,7 +6800,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let favourites = Favourites::new(None).unwrap();
+            let state = StateStore::new(None).unwrap();
             for _ in 0..4 {
                 let (stream, _) = listener.accept().unwrap();
                 handle_connection(
@@ -5199,8 +6810,7 @@ mod tests {
                     &ReviewHub::default(),
                     false,
                     None,
-                    &favourites,
-                    &DeletionMarks::new(None).unwrap(),
+                    &state,
                 )
                 .unwrap();
             }
@@ -5220,7 +6830,7 @@ mod tests {
         let liked = request("GET", "/?view=gallery");
         assert!(liked.find("href=\"/z.svg\"").unwrap() < liked.find("href=\"/a.svg\"").unwrap());
         assert!(liked.contains("data-favourite=\"true\""));
-        assert!(liked.contains("title=\"已点赞\">♥</span>"));
+        assert!(liked.contains("class=\"favourite-mark\" title=\"已点赞\"><svg"));
         assert!(request("DELETE", "/z.svg?mode=favourite").starts_with("HTTP/1.1 204"));
         let unliked = request("GET", "/");
         assert!(
@@ -5248,13 +6858,7 @@ mod tests {
         fs::write(root.join("notes.md"), "# hi\n").unwrap();
         fs::create_dir(root.join("docs")).unwrap();
 
-        let page = render_directory_page(
-            root,
-            root,
-            &Favourites::new(None).unwrap(),
-            &DeletionMarks::new(None).unwrap(),
-        )
-        .unwrap();
+        let page = render_directory_page(root, root, &StateStore::new(None).unwrap()).unwrap();
 
         assert!(page.contains("<body>"));
         assert!(page.contains("class=\"listing\""));
@@ -5264,14 +6868,15 @@ mod tests {
         assert!(page.contains("HTTP / DIRECTORY"));
         assert!(page.contains("class=\"entry file image\""));
         assert!(page.contains("class=\"entry file image vector\""));
-        assert!(page.contains("src=\"/photo.png?mode=thumb\""));
-        assert!(page.contains("data-gallery-src=\"/photo.png?mode=gallery-thumb\""));
-        assert!(page.contains("data-preview-src=\"/photo.png?mode=asset\""));
-        assert!(page.contains("src=\"/icon.svg?mode=asset\""));
+        assert!(page.contains("src=\"/photo.png?mode=thumb&amp;v="));
+        assert!(page.contains("data-gallery-src=\"/photo.png?mode=gallery-thumb&amp;v="));
+        assert!(page.contains("data-preview-src=\"/photo.png?mode=gallery-preview&amp;v="));
+        assert!(page.contains("data-original-src=\"/photo.png?mode=asset&amp;v="));
+        assert!(page.contains("src=\"/icon.svg?mode=asset&amp;v="));
         assert!(page.contains("class=\"entry file\" href=\"/notes.md\""));
         assert!(!page.contains("notes.md?mode=thumb"));
         assert!(page.contains("class=\"entry folder\" href=\"/docs/\""));
-        assert!(page.contains("data-list-src=\"/photo.png?mode=thumb\""));
+        assert!(page.contains("data-list-src=\"/photo.png?mode=thumb&amp;v="));
         assert!(
             page.contains(".entry.image .glyph img { width:100%; height:100%; object-fit:cover;")
         );
@@ -5283,11 +6888,39 @@ mod tests {
             "setGallery(new URLSearchParams(location.search).get('view') === 'gallery', false)"
         ));
         assert!(page.contains("id=\"image-lightbox\""));
+        assert!(page.contains("id=\"scroll-jumps\""));
+        assert!(page.contains("id=\"scroll-to-top\""));
+        assert!(page.contains("id=\"scroll-to-bottom\""));
+        assert!(page.contains("new ResizeObserver(scheduleScrollJumpUpdate)"));
+        assert!(page.contains("id=\"lightbox-position\""));
+        assert!(page.contains("id=\"lightbox-filmstrip\""));
         assert!(page.contains("id=\"preview-previous\""));
+        assert!(page.contains("const preloadAdjacentImages = () =>"));
+        assert!(page.contains("preloadAdjacentImages();"));
         assert!(page.contains("id=\"preview-next\""));
         assert!(page.contains("id=\"deletion-toggle\""));
-        assert!(page.contains(">标记删除</button>"));
-        assert!(page.contains("marked ? '取消标记' : '标记删除'"));
+        assert!(page.contains("id=\"favourite-burst\""));
+        assert!(page.contains("id=\"carousel-toggle\""));
+        assert!(page.contains("commentToggle.className = 'comment-toggle'"));
+        assert!(page.contains("viewerControls.insertBefore(commentToggle, deletionToggle)"));
+        assert!(page.contains("viewerExtras.hidden = true"));
+        assert!(page.contains("if (event.key.toLowerCase() === 'c')"));
+        assert!(page.contains("?mode=gallery-comments"));
+        assert!(page.contains("class=\"gallery-comment-composer\""));
+        assert!(page.contains("data-comment-edit"));
+        assert!(page.contains("data-comment-delete"));
+        assert!(page.contains("data-comment-delete-all"));
+        assert!(page.contains("submitGalleryCommentAction({type: 'delete-all'})"));
+        assert!(page.contains(
+            "const carouselEffects = ['drift', 'lift', 'depth', 'soft-focus', 'curtain']"
+        ));
+        assert!(page.contains("carouselTimer = setTimeout(advanceCarousel, 5000)"));
+        assert!(page.contains("carouselQueue = shuffle"));
+        assert!(page.contains("if (event.key === 'p')"));
+        assert!(page.contains("image-lightbox.carousel-mode"));
+        assert!(page.contains("document.addEventListener('visibilitychange'"));
+        assert!(page.contains("deletionToggle.innerHTML = svgIcon"));
+        assert!(page.contains("marked ? '取消标记 (m)' : '标记删除 (m)'"));
         assert!(page.contains("id=\"deletion-filter\""));
         assert!(page.contains("id=\"delete-marked-images\""));
         assert!(page.contains(
@@ -5295,22 +6928,93 @@ mod tests {
         ));
         assert!(page.contains("id=\"clear-deletion-marks\" type=\"button\" hidden"));
         assert!(page.contains("?mode=clear-deletion-marks"));
-        assert!(page.contains("moveButtons.forEach(button => { button.hidden = enabled; })"));
+        assert!(page.contains("moveFavouriteButton.hidden = enabled"));
         assert!(page.contains("id=\"delete-marked-dialog\""));
         assert!(page.contains("if (event.key === 'm')"));
         assert!(page.contains("?mode=deletion-mark"));
         assert!(page.contains("?mode=delete-marked"));
-        assert!(page.contains("if (event.target === lightbox) closeLightbox();"));
-        assert!(page.contains("if (event.key === 'Escape') closeLightbox();"));
-        assert!(page.contains("lightbox.addEventListener('touchstart'"));
-        assert!(page.contains("stepPreview(dy < 0 ? 1 : -1)"));
-        assert!(page.contains("if (event.target === lightboxImage)"));
-        assert!(page.contains("longPressTimer = setTimeout"));
-        assert!(page.contains("touch-action:pan-x pinch-zoom"));
+        assert!(page.contains("lightboxClose.addEventListener('click', closeLightbox)"));
+        assert!(page.contains("lightbox.addEventListener('pointermove', updateMouseChrome"));
+        assert!(page.contains("mouseInChromeZone = true"));
+        assert!(page.contains("showChrome(true)"));
+        assert!(page.contains("if (opening) {"));
+        assert!(page.contains("lightbox.classList.add('chrome-hidden')"));
+        assert!(page.contains("if (!gesture.imageTap) {"));
+        assert!(
+            page.contains("if (lightbox.classList.contains('carousel-mode')) setCarousel(false)")
+        );
+        assert!(page.contains("lightbox.addEventListener('pointerdown'"));
+        assert!(page.contains("stepPreview(delta < 0 ? 1 : -1, delta)"));
+        assert!(page.contains("const doubleTap = lastImageTap"));
+        assert!(page.contains("imageTap: event.target === lightboxImage"));
+        assert!(page.contains("if (gesture.moved) return"));
+        assert!(page.contains("animateFavouriteFeedback(liked, origin)"));
+        assert!(!page.contains("longPressTimer"));
+        assert!(page.contains("const animatePreview = (outgoing, outgoingBackdrop, direction, effect, gestureOffset = null, gestureIncoming = null) =>"));
+        assert!(page.contains("lightboxBackdrop.className = 'carousel-backdrop'"));
+        assert!(page.contains("background-size:cover"));
+        assert!(page.contains("filter:blur(12px) brightness(.4) saturate(1.06)"));
+        assert!(page.contains("outgoingBackdropAnimation"));
+        assert!(page.contains("const vertical = mobileTouch.matches"));
+        assert!(page.contains("`${index + 1} / ${entries.length}`"));
+        assert!(page.contains("for (let offset = -3; offset <= 3; offset++)"));
+        assert!(page.contains("button.addEventListener('click', () => switchPreview"));
+        assert!(page.contains("touch-action:none"));
+        assert!(page.contains("position:absolute; z-index:1; inset:0; display:block; width:100%; height:100%; object-fit:scale-down"));
     }
 
     #[test]
-    fn directory_hides_markdown_review_sidecars() {
+    fn gallery_comment_editor_owns_keyboard_input_and_shares_review_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbImage::from_pixel(24, 16, image::Rgb([40, 90, 180]))
+            .save(directory.path().join("photo.png"))
+            .unwrap();
+        let page = render_directory_page(
+            directory.path(),
+            directory.path(),
+            &StateStore::new(None).unwrap(),
+        )
+        .unwrap();
+        let markdown = render_markdown_page("# Review", "review.md");
+
+        assert!(page.contains("const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity'"));
+        assert!(markdown.contains("const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity'"));
+        assert!(!page.contains("http-gallery-comment-author"));
+        assert!(page.contains("const commentEditorActive = !commentsDrawer.hidden"));
+        assert!(page.contains(
+            "event.target === galleryCommentAuthor || event.target === galleryCommentBody"
+        ));
+        assert!(page.contains("galleryCommentComposer.requestSubmit()"));
+        assert!(page.contains("if (event.metaKey)"));
+        assert!(page.contains("galleryCommentBody.setRangeText('\\n'"));
+        assert!(page.contains("Enter 提交 · ⌘ Enter 换行"));
+    }
+
+    #[test]
+    fn gallery_fullscreen_swipe_and_favourite_effect_contracts_are_embedded() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbImage::from_pixel(24, 16, image::Rgb([40, 90, 180]))
+            .save(directory.path().join("photo.png"))
+            .unwrap();
+        let page = render_directory_page(
+            directory.path(),
+            directory.path(),
+            &StateStore::new(None).unwrap(),
+        )
+        .unwrap();
+
+        assert!(page.contains("element.requestFullscreen || element.webkitRequestFullscreen"));
+        assert!(page.contains("document.exitFullscreen || document.webkitExitFullscreen"));
+        assert!(page.contains("document.addEventListener('webkitfullscreenchange'"));
+        assert!(page.contains(".image-lightbox:-webkit-full-screen"));
+        assert!(page.contains("if (stepPreview(delta < 0 ? 1 : -1, delta)) return"));
+        assert!(page.contains("const incomingTarget = gestureIncoming || lightboxImage"));
+        assert!(page.contains("lightbox.append(heartParticles)"));
+        assert!(page.contains("const particleRect = lightbox.getBoundingClientRect()"));
+    }
+
+    #[test]
+    fn directory_hides_review_and_gallery_comment_sidecars() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("spec.md"), "# Spec").unwrap();
         fs::write(
@@ -5318,17 +7022,22 @@ mod tests {
             r#"{"version":1,"comments":[]}"#,
         )
         .unwrap();
+        fs::write(
+            directory.path().join(".gallery-comments.json"),
+            r#"{"version":1,"comments":[]}"#,
+        )
+        .unwrap();
 
         let page = render_directory_page(
             directory.path(),
             directory.path(),
-            &Favourites::new(None).unwrap(),
-            &DeletionMarks::new(None).unwrap(),
+            &StateStore::new(None).unwrap(),
         )
         .unwrap();
 
         assert!(page.contains("spec.md"));
         assert!(!page.contains("spec.md.review.json"));
+        assert!(!page.contains("href=\"/.gallery-comments.json\""));
         assert!(page.contains("1 个文件"));
     }
 
@@ -5359,8 +7068,7 @@ mod tests {
                         &reviews,
                         false,
                         None,
-                        &Favourites::new(None).unwrap(),
-                        &DeletionMarks::new(None).unwrap(),
+                        &StateStore::new(None).unwrap(),
                     )
                     .unwrap();
                 }));
@@ -5459,20 +7167,14 @@ mod tests {
         fs::write(root.join("one.txt"), "one").unwrap();
         fs::write(root.join("two.txt"), "two").unwrap();
 
-        let page = render_directory_page(
-            root,
-            root,
-            &Favourites::new(None).unwrap(),
-            &DeletionMarks::new(None).unwrap(),
-        )
-        .unwrap();
+        let page = render_directory_page(root, root, &StateStore::new(None).unwrap()).unwrap();
 
         assert!(page.contains("<body>"));
         assert!(page.contains("class=\"listing\""));
         assert!(!page.contains("class=\"listing gallery\""));
         assert!(page.contains("id=\"gallery-toggle\""));
         assert!(page.contains("data-gallery-src="));
-        assert!(page.contains("src=\"/photo.png?mode=thumb\""));
+        assert!(page.contains("src=\"/photo.png?mode=thumb&amp;v="));
     }
 
     #[test]
@@ -5496,6 +7198,12 @@ mod tests {
         assert_eq!(gallery_thumb.width(), 512);
         assert_eq!(gallery_thumb.height(), 128);
 
+        let (bytes, _) =
+            render_image_thumbnail(&fs::read(&path).unwrap(), GALLERY_PREVIEW_MAX_EDGE).unwrap();
+        let gallery_preview = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(gallery_preview.width(), 800);
+        assert_eq!(gallery_preview.height(), 200);
+
         let transparent = directory.path().join("alpha.png");
         image::RgbaImage::from_pixel(64, 64, image::Rgba([12, 24, 48, 80]))
             .save(&transparent)
@@ -5509,19 +7217,26 @@ mod tests {
     #[test]
     fn thumbnail_url_skips_non_images_and_huge_files() {
         assert_eq!(
-            thumbnail_url("/photo.png", Path::new("photo.png"), 1024, false).as_deref(),
-            Some("/photo.png?mode=thumb")
+            thumbnail_url(
+                "/photo.png",
+                Path::new("photo.png"),
+                1024,
+                false,
+                Some("v1")
+            )
+            .as_deref(),
+            Some("/photo.png?mode=thumb&amp;v=v1")
         );
         assert_eq!(
-            thumbnail_url("/photo.png", Path::new("photo.png"), 1024, true).as_deref(),
-            Some("/photo.png?mode=gallery-thumb")
+            thumbnail_url("/photo.png", Path::new("photo.png"), 1024, true, Some("v1")).as_deref(),
+            Some("/photo.png?mode=gallery-thumb&amp;v=v1")
         );
         assert_eq!(
-            thumbnail_url("/logo.svg", Path::new("logo.svg"), 2048, true).as_deref(),
-            Some("/logo.svg?mode=asset")
+            thumbnail_url("/logo.svg", Path::new("logo.svg"), 2048, true, Some("v1")).as_deref(),
+            Some("/logo.svg?mode=asset&amp;v=v1")
         );
         assert_eq!(
-            thumbnail_url("/notes.md", Path::new("notes.md"), 128, false),
+            thumbnail_url("/notes.md", Path::new("notes.md"), 128, false, Some("v1")),
             None
         );
         assert_eq!(
@@ -5529,8 +7244,25 @@ mod tests {
                 "/photo.png",
                 Path::new("photo.png"),
                 MAX_THUMBNAIL_SOURCE + 1,
-                true
+                true,
+                Some("v1")
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn gallery_preview_url_uses_screen_derivative_and_keeps_special_images_original() {
+        assert_eq!(
+            gallery_preview_url("/photo.jpg", Path::new("photo.jpg"), 1024, Some("v1")).as_deref(),
+            Some("/photo.jpg?mode=gallery-preview&amp;v=v1")
+        );
+        assert_eq!(
+            gallery_preview_url("/movie.gif", Path::new("movie.gif"), 1024, Some("v1")),
+            None
+        );
+        assert_eq!(
+            gallery_preview_url("/logo.svg", Path::new("logo.svg"), 1024, Some("v1")),
             None
         );
     }

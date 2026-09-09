@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::image_cache::{thumbnail_key, ImageCache};
 
-const MAX_CONCURRENT_THUMBNAILS: usize = 8;
+const MAX_CONCURRENT_THUMBNAILS: usize = 2;
 type Thumbnail = (Vec<u8>, &'static str);
 type SharedResult = Result<Arc<Thumbnail>, Arc<io::Error>>;
 
@@ -65,16 +65,17 @@ impl ThumbnailGenerator {
 
 pub(crate) fn thumbnail(
     path: &Path,
-    source: &[u8],
+    source_version: &str,
     max_edge: u32,
     cache: Option<&ImageCache>,
+    render: impl FnOnce() -> io::Result<Thumbnail>,
 ) -> SharedResult {
     static GENERATOR: OnceLock<ThumbnailGenerator> = OnceLock::new();
     GENERATOR.get_or_init(ThumbnailGenerator::default).generate(
-        thumbnail_key(path, source, max_edge),
+        thumbnail_key(path, source_version, max_edge),
         || match cache {
-            Some(cache) => cache.thumbnail(path, source, max_edge),
-            None => crate::render_image_thumbnail(source, max_edge),
+            Some(cache) => cache.thumbnail(path, source_version, max_edge, render),
+            None => render(),
         },
     )
 }
@@ -99,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn limits_active_jobs_to_eight_and_runs_queued_jobs() {
+    fn limits_active_jobs_to_two_and_runs_queued_jobs() {
         let generator = Arc::new(ThumbnailGenerator::default());
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -126,11 +127,11 @@ mod tests {
                     .unwrap()
             }));
         }
-        for _ in 0..8 {
+        for _ in 0..2 {
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
         wait_until(|| generator.state.lock().unwrap().jobs.len() == 16);
-        assert_eq!(active.load(Ordering::SeqCst), 8);
+        assert_eq!(active.load(Ordering::SeqCst), 2);
         assert!(matches!(
             started_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -141,7 +142,7 @@ mod tests {
         for (index, worker) in workers.into_iter().enumerate() {
             assert_eq!(worker.join().unwrap().0, vec![index as u8]);
         }
-        assert_eq!(peak.load(Ordering::SeqCst), 8);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
         let state = generator.state.lock().unwrap();
         assert_eq!(state.active, 0);
         assert!(state.jobs.is_empty());
@@ -224,10 +225,10 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
         let inputs = [
-            ("/a/photo.png", b"original".as_slice(), 128),
-            ("/a/photo.png", b"replacement".as_slice(), 128),
-            ("/a/photo.png", b"original".as_slice(), 512),
-            ("/b/photo.png", b"original".as_slice(), 128),
+            ("/a/photo.png", "original", 128),
+            ("/a/photo.png", "replacement", 128),
+            ("/a/photo.png", "original", 512),
+            ("/b/photo.png", "original", 128),
         ];
         let workers: Vec<_> = inputs
             .into_iter()
@@ -247,10 +248,16 @@ mod tests {
                 })
             })
             .collect();
-        for _ in 0..4 {
+        for _ in 0..2 {
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        for _ in 0..4 {
+        for _ in 0..2 {
+            release_tx.send(()).unwrap();
+        }
+        for _ in 0..2 {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for _ in 0..2 {
             release_tx.send(()).unwrap();
         }
         for (index, worker) in workers.into_iter().enumerate() {
