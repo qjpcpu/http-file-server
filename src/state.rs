@@ -15,7 +15,7 @@ impl StateStore {
         let connection = match cache_root {
             Some(root) => {
                 fs::create_dir_all(root)?;
-                Connection::open(root.join("http.sqlite")).map_err(sqlite_error)?
+                Connection::open(root.join("webdir.sqlite")).map_err(sqlite_error)?
             }
             None => Connection::open_in_memory().map_err(sqlite_error)?,
         };
@@ -136,7 +136,7 @@ mod tests {
         let reopened = StateStore::new(Some(cache.path())).unwrap();
         assert!(reopened.is_favourite(first).unwrap());
         assert!(reopened.is_deletion_marked(second).unwrap());
-        assert!(cache.path().join("http.sqlite").is_file());
+        assert!(cache.path().join("webdir.sqlite").is_file());
         assert!(!cache.path().join("favourites").exists());
         assert!(!cache.path().join("deletion-marks").exists());
     }

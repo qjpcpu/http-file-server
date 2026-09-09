@@ -553,7 +553,7 @@ fn atomic_write(path: &Path, content: &[u8], generation: u64) -> io::Result<()> 
 
     for attempt in 0..16_u8 {
         let temporary = parent.join(format!(
-            ".{name}.http-file-server-{}-{generation}-{attempt}.tmp",
+            ".{name}.webdir-{}-{generation}-{attempt}.tmp",
             std::process::id()
         ));
         match OpenOptions::new()

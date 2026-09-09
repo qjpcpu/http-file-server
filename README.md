@@ -1,8 +1,8 @@
-# http
+# webdir
 
 把一个本地目录，变成可浏览、可阅读、可审阅的轻量工作空间。
 
-`http` 是一个单二进制文件服务器。它不要求项目结构，不依赖前端构建环境：在任意目录启动，
+`webdir` 是一个单二进制文件服务器。它不要求项目结构，不依赖前端构建环境：在任意目录启动，
 即可获得清晰的文件导航、内容预览、Markdown 协作编辑，以及能被 AI 直接读取的审阅记录。
 
 ## 从目录到工作流
@@ -26,17 +26,17 @@ cargo run --release
 cargo run --release -- -p 3000 --dir /data/photos
 
 # 启用持久状态与图片衍生缓存
-cargo run --release -- -p 3000 --dir /data/photos --cache /data/http.cache
+cargo run --release -- -p 3000 --dir /data/photos --cache /data/webdir.cache
 
 # 启动后写入 PID 文件
-cargo run --release -- -p 3000 --pid /tmp/http-file-server.pid
+cargo run --release -- -p 3000 --pid /tmp/webdir.pid
 ```
 
 也可以先编译，再直接运行单个二进制：
 
 ```bash
 cargo build --release
-./target/release/http -p 3000 --dir /data/photos --cache /data/http.cache
+./target/release/webdir -p 3000 --dir /data/photos --cache /data/webdir.cache
 ```
 
 未显式指定端口时，如果 `8080` 已被占用，服务会自动选择一个可用端口。相对路径以启动时的
@@ -120,7 +120,7 @@ codex> 处理掉 your-plan.md.review.json 的评论
 
 ## 状态与缓存
 
-指定 `--cache DIR` 后，运行状态统一写入 `DIR/http.sqlite`：
+指定 `--cache DIR` 后，运行状态统一写入 `DIR/webdir.sqlite`：
 
 - `favourites` 保存图片点赞状态。
 - `deletion_marks` 保存待删除标记。
@@ -133,7 +133,7 @@ codex> 处理掉 your-plan.md.review.json 的评论
 GIF、SVG、超出处理限制或转换失败的图片直接使用原文件。
 
 缓存目录默认最多占用 2 GiB。服务启动后及每 6 小时清理一次，30 天未使用的衍生图优先删除；
-超过上限时按最近使用时间清理到约 1.6 GiB。清理只作用于 `thumbnails/`，不会触碰 `http.sqlite`。
+超过上限时按最近使用时间清理到约 1.6 GiB。清理只作用于 `thumbnails/`，不会触碰 `webdir.sqlite`。
 
 页面最多并发加载 4 张缩略图，服务端最多同时生成 2 张衍生图。同一路径、尺寸和文件版本的并发请求
 会共享一次处理结果，快速滚动时优先处理靠近视口的图片。
@@ -161,8 +161,8 @@ npm run test:browser
 ## 静态网站模式
 
 ```bash
-cargo run --release -- --web -p 3000 --dir ./public
+cargo run --release -- --raw -p 3000 --dir ./public
 ```
 
-`--web` 只接受 GET 和 HEAD。目录优先返回 `index.html`，不会生成目录页、预览页、编辑接口或美化错误页；
+`--raw` 只接受 GET 和 HEAD。目录优先返回 `index.html`，不会生成目录页、预览页、编辑接口或美化错误页；
 目录中没有 `index.html` 时返回 `403`。

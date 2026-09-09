@@ -36,12 +36,12 @@ const MAX_THUMBNAIL_SOURCE: u64 = 64 * 1024 * 1024;
 const THUMBNAIL_MAX_EDGE: u32 = 128;
 const GALLERY_THUMBNAIL_MAX_EDGE: u32 = 512;
 const GALLERY_PREVIEW_MAX_EDGE: u32 = 2560;
-const DRAWIO_VIEWER_PATH: &str = "/__http_file_server/drawio-viewer-31.3.1.js";
+const DRAWIO_VIEWER_PATH: &str = "/__webdir/drawio-viewer-31.3.1.js";
 const DRAWIO_VIEWER_JS: &[u8] = include_bytes!("../assets/drawio-viewer-static-31.3.1.min.js");
-const MERMAID_PATH: &str = "/__http_file_server/mermaid-11.17.2.min.js";
+const MERMAID_PATH: &str = "/__webdir/mermaid-11.17.2.min.js";
 const MERMAID_JS: &[u8] = include_bytes!("../assets/mermaid-11.17.2.min.js");
 const MARKDOWN_MERMAID_JS: &str = include_str!("../assets/markdown-mermaid.js");
-const YJS_PATH: &str = "/__http_file_server/yjs-13.6.32.min.js";
+const YJS_PATH: &str = "/__webdir/yjs-13.6.32.min.js";
 const YJS_JS: &[u8] = include_bytes!("../assets/yjs-13.6.32.min.js");
 
 #[derive(Debug, PartialEq)]
@@ -49,7 +49,7 @@ struct PortConfig {
     port: u16,
     fallback_to_random: bool,
     pid_file: Option<PathBuf>,
-    web: bool,
+    raw: bool,
     cache_dir: Option<PathBuf>,
     serve_dir: PathBuf,
 }
@@ -138,7 +138,7 @@ fn main() {
                         &root,
                         &collaboration,
                         &reviews,
-                        port_config.web,
+                        port_config.raw,
                         image_cache.as_ref(),
                         &state,
                     ) {
@@ -158,7 +158,7 @@ where
     let mut port = DEFAULT_PORT;
     let mut fallback_to_random = true;
     let mut pid_file = None;
-    let mut web = false;
+    let mut raw = false;
     let mut cache_dir = None;
     let mut serve_dir = PathBuf::from(".");
     while let Some(arg) = args.next() {
@@ -192,7 +192,7 @@ where
                 let value = args.next().ok_or_else(|| format!("{arg} 后需要托管目录"))?;
                 serve_dir = PathBuf::from(value);
             }
-            "--web" => web = true,
+            "--raw" => raw = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 return Ok(None);
@@ -204,7 +204,7 @@ where
         port,
         fallback_to_random,
         pid_file,
-        web,
+        raw,
         cache_dir,
         serve_dir,
     }))
@@ -220,7 +220,7 @@ fn bind_listener(config: &PortConfig) -> io::Result<TcpListener> {
 }
 
 fn usage() -> &'static str {
-    "用法: http [-p PORT] [-pid FILE] [-cache DIR] [-dir DIR] [--web]\n\n选项:\n  -p, --port PORT    指定监听端口（默认 8080）\n  -pid, --pid FILE   将启动进程 PID 写入指定文件\n  -cache, --cache DIR 指定缓存根目录（缩略图、点赞和待删除标记存入 DIR）\n  -dir, --dir DIR    指定托管目录（默认当前目录）\n  --web             以原始静态网站服务器模式运行\n  -h, --help         显示帮助"
+    "用法: webdir [-p PORT] [-pid FILE] [-cache DIR] [-dir DIR] [--raw]\n\n选项:\n  -p, --port PORT    指定监听端口（默认 8080）\n  -pid, --pid FILE   将启动进程 PID 写入指定文件\n  -cache, --cache DIR 指定缓存根目录（缩略图、点赞和待删除标记存入 DIR）\n  -dir, --dir DIR    指定托管目录（默认当前目录）\n  --raw             以原始静态网站服务器模式运行\n  -h, --help         显示帮助"
 }
 
 fn write_pid_file(path: &Path) -> io::Result<()> {
@@ -232,7 +232,7 @@ fn handle_connection(
     root: &Path,
     collaboration: &CollaborationHub,
     reviews: &ReviewHub,
-    web: bool,
+    raw: bool,
     image_cache: Option<&ImageCache>,
     state: &StateStore,
 ) -> io::Result<()> {
@@ -245,14 +245,14 @@ fn handle_connection(
     let target = parts.next().unwrap_or("");
     let head_only = method == "HEAD";
 
-    if (web && !matches!(method, "GET" | "HEAD"))
-        || (!web && !matches!(method, "GET" | "HEAD" | "POST" | "PUT" | "DELETE"))
+    if (raw && !matches!(method, "GET" | "HEAD"))
+        || (!raw && !matches!(method, "GET" | "HEAD" | "POST" | "PUT" | "DELETE"))
     {
         return send_text(
             &mut stream,
             405,
             "Method Not Allowed",
-            if web {
+            if raw {
                 "仅支持 GET 和 HEAD\n"
             } else {
                 "仅支持 GET、HEAD、POST、PUT 和 DELETE\n"
@@ -277,8 +277,8 @@ fn handle_connection(
 
     let (request_path, query) = target.split_once('?').unwrap_or((target, ""));
     let request_path = request_path.split('#').next().unwrap_or("/");
-    if web {
-        return handle_web_request(&mut stream, root, request_path, query, head_only);
+    if raw {
+        return handle_raw_request(&mut stream, root, request_path, query, head_only);
     }
     if matches!(method, "GET" | "HEAD") && request_path == DRAWIO_VIEWER_PATH {
         return send_content(
@@ -880,7 +880,7 @@ fn handle_connection(
     )
 }
 
-fn handle_web_request(
+fn handle_raw_request(
     stream: &mut TcpStream,
     root: &Path,
     request_path: &str,
@@ -1389,12 +1389,12 @@ fn render_site_icon(root: &Path) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or("HTTP");
+        .unwrap_or("webdir");
     let initial = name
         .chars()
         .find(|character| !character.is_whitespace())
         .map(|character| character.to_uppercase().collect::<String>())
-        .unwrap_or_else(|| "H".to_string());
+        .unwrap_or_else(|| "W".to_string());
     let hash = name.bytes().fold(2_166_136_261_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
     });
@@ -1600,7 +1600,7 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
         ""
     };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><nav class=\"scroll-jumps\" id=\"scroll-jumps\" aria-label=\"页面快速跳转\" hidden><button id=\"scroll-to-top\" type=\"button\" aria-label=\"回到顶部\" title=\"回到顶部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 14 6-6 6 6\"></path><path d=\"M6 19h12\"></path></svg></button><button id=\"scroll-to-bottom\" type=\"button\" aria-label=\"回到底部\" title=\"回到底部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 10 6 6 6-6\"></path><path d=\"M6 5h12\"></path></svg></button></nav><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><div class=\"lightbox-shell\"><div class=\"lightbox-position\" id=\"lightbox-position\" aria-live=\"polite\"></div><nav class=\"lightbox-filmstrip\" id=\"lightbox-filmstrip\" aria-label=\"图片缩略图导航\"></nav><figure><div class=\"lightbox-stage\"><img class=\"lightbox-image\" alt=\"\"><div class=\"favourite-burst\" id=\"favourite-burst\" aria-hidden=\"true\" hidden><svg viewBox=\"0 0 24 24\"><path d=\"M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z\"></path></svg></div></div><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (d)\" aria-pressed=\"false\" title=\"标记待删除 (d)\">标记删除</button><button class=\"carousel-toggle\" id=\"carousel-toggle\" type=\"button\" aria-label=\"进入轮播 (p)\" aria-pressed=\"false\" title=\"进入轮播 (p)\">轮播</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure></div>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">WEBDIR / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><nav class=\"scroll-jumps\" id=\"scroll-jumps\" aria-label=\"页面快速跳转\" hidden><button id=\"scroll-to-top\" type=\"button\" aria-label=\"回到顶部\" title=\"回到顶部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 14 6-6 6 6\"></path><path d=\"M6 19h12\"></path></svg></button><button id=\"scroll-to-bottom\" type=\"button\" aria-label=\"回到底部\" title=\"回到底部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 10 6 6 6-6\"></path><path d=\"M6 5h12\"></path></svg></button></nav><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><div class=\"lightbox-shell\"><div class=\"lightbox-position\" id=\"lightbox-position\" aria-live=\"polite\"></div><nav class=\"lightbox-filmstrip\" id=\"lightbox-filmstrip\" aria-label=\"图片缩略图导航\"></nav><figure><div class=\"lightbox-stage\"><img class=\"lightbox-image\" alt=\"\"><div class=\"favourite-burst\" id=\"favourite-burst\" aria-hidden=\"true\" hidden><svg viewBox=\"0 0 24 24\"><path d=\"M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z\"></path></svg></div></div><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (d)\" aria-pressed=\"false\" title=\"标记待删除 (d)\">标记删除</button><button class=\"carousel-toggle\" id=\"carousel-toggle\" type=\"button\" aria-label=\"进入轮播 (p)\" aria-pressed=\"false\" title=\"进入轮播 (p)\">轮播</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure></div>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
     ))
 }
 
@@ -2522,11 +2522,11 @@ header { position:sticky; top:0; z-index:3; display:flex; align-items:center; ga
 
 const DRAWIO_JS: &str = r#"
 const viewerStatus = document.querySelector('#viewer-status');
-window.RESOURCE_BASE = '/__http_file_server/drawio-assets';
-window.STENCIL_PATH = '/__http_file_server/drawio-assets/stencils';
-window.SHAPES_PATH = '/__http_file_server/drawio-assets/shapes';
-window.IMAGE_PATH = '/__http_file_server/drawio-assets/images';
-window.STYLE_PATH = '/__http_file_server/drawio-assets/styles';
+window.RESOURCE_BASE = '/__webdir/drawio-assets';
+window.STENCIL_PATH = '/__webdir/drawio-assets/stencils';
+window.SHAPES_PATH = '/__webdir/drawio-assets/shapes';
+window.IMAGE_PATH = '/__webdir/drawio-assets/images';
+window.STYLE_PATH = '/__webdir/drawio-assets/styles';
 
 function drawioViewerFailed() {
   viewerStatus.classList.add('error');
@@ -2769,7 +2769,7 @@ if (galleryToggle) {
   const deleteMarkedConfirm = deleteMarkedDialog.querySelector('#delete-marked-confirm');
   const mobileTouch = matchMedia('(hover: none) and (pointer: coarse)');
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-  const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity';
+  const REVIEW_IDENTITY_KEY = 'webdir-review-identity';
   const imageModel = Array.from(listing.querySelectorAll('.entry.image[data-preview-src]'));
   const visibleImages = () => imageModel.filter(entry => entry.isConnected && !entry.hidden);
   let previewTrigger = null;
@@ -4665,7 +4665,7 @@ const identityError = document.querySelector('#identity-error');
 const identityButton = document.querySelector('#identity-button');
 const overlayReviewLayout = matchMedia('(max-width:900px)');
 const touchReviewDevice = matchMedia('(hover: none) and (pointer: coarse)');
-const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity';
+const REVIEW_IDENTITY_KEY = 'webdir-review-identity';
 commentBody.placeholder = 'Enter 提交 · ⌘ Enter 换行';
 const LOCAL_ORIGIN = Symbol('local-input');
 const REMOTE_ORIGIN = Symbol('remote-update');
@@ -5784,7 +5784,7 @@ mod tests {
                 port: 8080,
                 fallback_to_random: true,
                 pid_file: None,
-                web: false,
+                raw: false,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
             })
@@ -5795,7 +5795,7 @@ mod tests {
                 port: 3000,
                 fallback_to_random: false,
                 pid_file: None,
-                web: false,
+                raw: false,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
             })
@@ -5804,7 +5804,7 @@ mod tests {
             parse_args(
                 vec![
                     "-pid".into(),
-                    "/tmp/http.pid".into(),
+                    "/tmp/webdir.pid".into(),
                     "-p".into(),
                     "9000".into()
                 ]
@@ -5814,19 +5814,19 @@ mod tests {
             Some(PortConfig {
                 port: 9000,
                 fallback_to_random: false,
-                pid_file: Some(PathBuf::from("/tmp/http.pid")),
-                web: false,
+                pid_file: Some(PathBuf::from("/tmp/webdir.pid")),
+                raw: false,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
             })
         );
         assert_eq!(
-            parse_args(vec!["--web".into()].into_iter()).unwrap(),
+            parse_args(vec!["--raw".into()].into_iter()).unwrap(),
             Some(PortConfig {
                 port: 8080,
                 fallback_to_random: true,
                 pid_file: None,
-                web: true,
+                raw: true,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
             })
@@ -5842,7 +5842,7 @@ mod tests {
             port: occupied_port,
             fallback_to_random: true,
             pid_file: None,
-            web: false,
+            raw: false,
             cache_dir: None,
             serve_dir: PathBuf::from("."),
         })
@@ -5859,7 +5859,7 @@ mod tests {
             port: occupied_port,
             fallback_to_random: false,
             pid_file: None,
-            web: false,
+            raw: false,
             cache_dir: None,
             serve_dir: PathBuf::from("."),
         })
@@ -6036,7 +6036,7 @@ mod tests {
     }
 
     #[test]
-    fn web_mode_serves_index_and_files_without_special_rendering() {
+    fn raw_mode_serves_index_and_files_without_special_rendering() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("index.html"), "<h1>home</h1>").unwrap();
         fs::write(directory.path().join("notes.md"), "# Notes\n").unwrap();
@@ -6183,12 +6183,12 @@ mod tests {
 
     #[test]
     fn generates_a_site_icon_from_the_root_directory_name() {
-        let icon = render_site_icon(Path::new("/srv/http-file-server"));
+        let icon = render_site_icon(Path::new("/srv/webdir"));
         let escaped = render_site_icon(Path::new("/srv/<project>"));
 
         assert!(icon.starts_with("<svg"));
         assert!(icon.contains("viewBox=\"0 0 64 64\""));
-        assert!(icon.contains(">H</text>"));
+        assert!(icon.contains(">W</text>"));
         assert!(escaped.contains(">&lt;</text>"));
         assert!(!escaped.contains("><</text>"));
     }
@@ -6824,7 +6824,7 @@ mod tests {
         assert!(!page.contains("class=\"listing gallery\""));
         assert!(page.contains("id=\"gallery-toggle\""));
         assert!(page.contains("aria-pressed=\"false\""));
-        assert!(page.contains("HTTP / DIRECTORY"));
+        assert!(page.contains("WEBDIR / DIRECTORY"));
         assert!(page.contains("class=\"entry file image\""));
         assert!(page.contains("class=\"entry file image vector\""));
         assert!(page.contains("src=\"/photo.png?mode=thumb&amp;v="));
@@ -6935,8 +6935,8 @@ mod tests {
         .unwrap();
         let markdown = render_markdown_page("# Review", "review.md");
 
-        assert!(page.contains("const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity'"));
-        assert!(markdown.contains("const REVIEW_IDENTITY_KEY = 'http-file-server-review-identity'"));
+        assert!(page.contains("const REVIEW_IDENTITY_KEY = 'webdir-review-identity'"));
+        assert!(markdown.contains("const REVIEW_IDENTITY_KEY = 'webdir-review-identity'"));
         assert!(!page.contains("http-gallery-comment-author"));
         assert!(page.contains("const commentEditorActive = !commentsDrawer.hidden"));
         assert!(page.contains(

@@ -198,7 +198,7 @@ mod tests {
     fn prunes_expired_temporary_and_oldest_cached_images() {
         let root = tempfile::tempdir().unwrap();
         let thumbnails = root.path().join("thumbnails");
-        let database = root.path().join("http.sqlite");
+        let database = root.path().join("webdir.sqlite");
         fs::create_dir_all(&thumbnails).unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
         write_at(

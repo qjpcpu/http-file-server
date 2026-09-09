@@ -456,7 +456,7 @@ fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
         .unwrap_or("review");
     let write_id = NEXT_WRITE_ID.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(
-        ".{name}.http-file-server-{}-{write_id}.tmp",
+        ".{name}.webdir-{}-{write_id}.tmp",
         std::process::id()
     ));
     let result = (|| {

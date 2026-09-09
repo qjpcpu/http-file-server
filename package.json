@@ -1,5 +1,5 @@
 {
-  "name": "http-file-server-browser-tests",
+  "name": "webdir-browser-tests",
   "private": true,
   "scripts": {
     "test:browser": "playwright test",

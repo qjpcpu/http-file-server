@@ -396,23 +396,6 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "0.1.0"
-dependencies = [
- "image",
- "pulldown-cmark",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "syntect",
- "tempfile",
- "tungstenite",
- "two-face",
- "yrs",
-]
-
-[[package]]
-name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
@@ -1016,7 +999,7 @@ checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
 dependencies = [
  "bytes",
  "data-encoding",
- "http 1.5.0",
+ "http",
  "httparse",
  "log",
  "rand",
@@ -1112,6 +1095,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "webdir"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "pulldown-cmark",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "syntect",
+ "tempfile",
+ "tungstenite",
+ "two-face",
+ "yrs",
 ]
 
 [[package]]

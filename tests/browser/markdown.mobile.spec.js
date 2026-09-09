@@ -1,7 +1,7 @@
 const { test, expect } = require('@playwright/test');
 
 test('touch selection opens the range-comment composer and a body tap hides the panel', async ({page}) => {
-  await page.addInitScript(() => localStorage.setItem('http-file-server-review-identity', 'Alice'));
+  await page.addInitScript(() => localStorage.setItem('webdir-review-identity', 'Alice'));
   await page.goto('/review.md');
   await expect(page.locator('#article')).toContainText('降低背景高光');
 
@@ -44,7 +44,7 @@ test('touch selection opens the range-comment composer and a body tap hides the 
 });
 
 test('document comments can be added, edited, and deleted on touch layouts', async ({page}) => {
-  await page.addInitScript(() => localStorage.setItem('http-file-server-review-identity', 'Alice'));
+  await page.addInitScript(() => localStorage.setItem('webdir-review-identity', 'Alice'));
   await page.goto('/review.md');
   await page.locator('#review-toggle').click();
   await page.locator('#document-comment').click();

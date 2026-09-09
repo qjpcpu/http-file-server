@@ -224,7 +224,7 @@ test('favourites organiser reports when there are no images to move', async ({pa
 });
 
 test('comments own keyboard input and reuse the Markdown review identity', async ({page}) => {
-  await page.addInitScript(() => localStorage.setItem('http-file-server-review-identity', 'Alice'));
+  await page.addInitScript(() => localStorage.setItem('webdir-review-identity', 'Alice'));
   await openGalleryImage(page);
   await page.request.post('/01-portrait.svg?mode=gallery-comments', {data: {type: 'delete-all'}});
   await page.locator('.lightbox-image').click({position: {x: 300, y: 300}});
@@ -285,7 +285,7 @@ test('comments keep a single-column drawer in a wide browser window', async ({pa
 });
 
 test('submitting a comment scrolls to the latest comment', async ({page}) => {
-  await page.addInitScript(() => localStorage.setItem('http-file-server-review-identity', 'Alice'));
+  await page.addInitScript(() => localStorage.setItem('webdir-review-identity', 'Alice'));
   await page.request.post('/01-portrait.svg?mode=gallery-comments', {data: {type: 'delete-all'}});
   for (let index = 0; index < 8; index += 1) {
     await page.request.post('/01-portrait.svg?mode=gallery-comments', {data: {
@@ -320,7 +320,7 @@ test('submitting a comment scrolls to the latest comment', async ({page}) => {
 
 test('comments keep the editor reachable in a compact browser window', async ({page}) => {
   await page.setViewportSize({width: 560, height: 360});
-  await page.addInitScript(() => localStorage.removeItem('http-file-server-review-identity'));
+  await page.addInitScript(() => localStorage.removeItem('webdir-review-identity'));
   await page.request.post('/01-portrait.svg?mode=gallery-comments', {data: {type: 'delete-all'}});
   await openGalleryImage(page);
   await page.keyboard.press('c');

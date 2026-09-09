@@ -110,7 +110,7 @@ test('mobile favourites organiser reports when there are no images to move', asy
 });
 
 test('mobile comments open as a bottom drawer and keep typing isolated from shortcuts', async ({page}) => {
-  await page.addInitScript(() => localStorage.setItem('http-file-server-review-identity', 'Alice'));
+  await page.addInitScript(() => localStorage.setItem('webdir-review-identity', 'Alice'));
   await page.request.post('/02-landscape.svg?mode=gallery-comments', {data: {type: 'delete-all'}});
   for (let index = 0; index < 6; index += 1) {
     await page.request.post('/02-landscape.svg?mode=gallery-comments', {data: {

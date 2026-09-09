@@ -1,8 +1,8 @@
 [package]
-name = "http"
+name = "webdir"
 version = "0.1.0"
 edition = "2021"
-description = "A tiny static file server"
+description = "A lightweight workspace for browsing and reviewing local files"
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
