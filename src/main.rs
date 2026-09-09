@@ -2733,7 +2733,7 @@ if (galleryToggle) {
   const shortcutHelp = document.createElement('aside');
   shortcutHelp.className = 'shortcut-help';
   shortcutHelp.hidden = true;
-  shortcutHelp.innerHTML = '<span>← → / J K 切图</span><span>F 点赞 · C 评论 · D 标记删除 · Ctrl K 直接删除</span><span>P 轮播 · 空格暂停</span><span>Esc 退出</span>';
+  shortcutHelp.innerHTML = '<span>← / J 上一张 · → / K 下一张</span><span>F 点赞 · C 评论 · D 标记删除 · Ctrl K 直接删除</span><span>P 轮播 · 空格暂停</span><span>Esc 退出</span>';
   const figure = lightbox.querySelector('figure');
   figure.append(imageInfo, shortcutHelp);
   previewPrevious.innerHTML = svgIcon(strokePath('m15 6-6 6 6 6'));
@@ -4199,8 +4199,8 @@ if (galleryToggle) {
       return;
     }
     let direction;
-    if (event.key === 'ArrowUp' || event.key === 'ArrowLeft' || event.key === 'k') direction = -1;
-    else if (event.key === 'ArrowDown' || event.key === 'ArrowRight' || event.key === 'j') direction = 1;
+    if (event.key === 'ArrowUp' || event.key === 'ArrowLeft' || event.key === 'j') direction = -1;
+    else if (event.key === 'ArrowDown' || event.key === 'ArrowRight' || event.key === 'k') direction = 1;
     else return;
     event.preventDefault();
     stepPreview(direction);

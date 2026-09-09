@@ -36,6 +36,11 @@ test('portrait layout, horizontal transitions, toolbar wake-up, and explicit clo
   const pathBeforeKey = await page.locator('#image-lightbox').getAttribute('data-file-path');
   await page.keyboard.press('ArrowDown');
   await expect(page.locator('#image-lightbox')).not.toHaveAttribute('data-file-path', pathBeforeKey);
+  const pathAfterArrowDown = await page.locator('#image-lightbox').getAttribute('data-file-path');
+  await page.keyboard.press('j');
+  await expect(page.locator('#image-lightbox')).toHaveAttribute('data-file-path', pathBeforeKey);
+  await page.keyboard.press('k');
+  await expect(page.locator('#image-lightbox')).toHaveAttribute('data-file-path', pathAfterArrowDown);
   await expect(page.locator('#image-lightbox')).toHaveClass(/chrome-hidden/);
   const transition = await page.evaluate(() => {
     const outgoing = document.querySelector('.preview-outgoing');
