@@ -1600,7 +1600,7 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
         ""
     };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><nav class=\"scroll-jumps\" id=\"scroll-jumps\" aria-label=\"页面快速跳转\" hidden><button id=\"scroll-to-top\" type=\"button\" aria-label=\"回到顶部\" title=\"回到顶部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 14 6-6 6 6\"></path><path d=\"M6 19h12\"></path></svg></button><button id=\"scroll-to-bottom\" type=\"button\" aria-label=\"回到底部\" title=\"回到底部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 10 6 6 6-6\"></path><path d=\"M6 5h12\"></path></svg></button></nav><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><div class=\"lightbox-shell\"><div class=\"lightbox-position\" id=\"lightbox-position\" aria-live=\"polite\"></div><nav class=\"lightbox-filmstrip\" id=\"lightbox-filmstrip\" aria-label=\"图片缩略图导航\"></nav><figure><div class=\"lightbox-stage\"><img class=\"lightbox-image\" alt=\"\"><div class=\"favourite-burst\" id=\"favourite-burst\" aria-hidden=\"true\" hidden><svg viewBox=\"0 0 24 24\"><path d=\"M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z\"></path></svg></div></div><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (m)\" aria-pressed=\"false\" title=\"标记待删除 (m)\">标记删除</button><button class=\"carousel-toggle\" id=\"carousel-toggle\" type=\"button\" aria-label=\"进入轮播 (p)\" aria-pressed=\"false\" title=\"进入轮播 (p)\">轮播</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure></div>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">HTTP / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><nav class=\"scroll-jumps\" id=\"scroll-jumps\" aria-label=\"页面快速跳转\" hidden><button id=\"scroll-to-top\" type=\"button\" aria-label=\"回到顶部\" title=\"回到顶部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 14 6-6 6 6\"></path><path d=\"M6 19h12\"></path></svg></button><button id=\"scroll-to-bottom\" type=\"button\" aria-label=\"回到底部\" title=\"回到底部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 10 6 6 6-6\"></path><path d=\"M6 5h12\"></path></svg></button></nav><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><div class=\"lightbox-shell\"><div class=\"lightbox-position\" id=\"lightbox-position\" aria-live=\"polite\"></div><nav class=\"lightbox-filmstrip\" id=\"lightbox-filmstrip\" aria-label=\"图片缩略图导航\"></nav><figure><div class=\"lightbox-stage\"><img class=\"lightbox-image\" alt=\"\"><div class=\"favourite-burst\" id=\"favourite-burst\" aria-hidden=\"true\" hidden><svg viewBox=\"0 0 24 24\"><path d=\"M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z\"></path></svg></div></div><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (d)\" aria-pressed=\"false\" title=\"标记待删除 (d)\">标记删除</button><button class=\"carousel-toggle\" id=\"carousel-toggle\" type=\"button\" aria-label=\"进入轮播 (p)\" aria-pressed=\"false\" title=\"进入轮播 (p)\">轮播</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure></div>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
     ))
 }
 
@@ -2719,12 +2719,12 @@ if (galleryToggle) {
   viewerControls.after(viewerExtras);
   const viewerTools = document.createElement('span');
   viewerTools.className = 'viewer-tools';
-  viewerTools.innerHTML = `<button type="button" data-zoom="out" aria-label="缩小 (-)">${svgIcon(strokePath('M6 12h12'))}</button><button type="button" data-view="fit" aria-label="适应窗口 (0)">适屏</button><button type="button" data-view="fill" aria-label="填满窗口">填满</button><button type="button" data-view="actual" aria-label="原始尺寸 (1)">1:1</button><button type="button" data-zoom="in" aria-label="放大 (+)">${svgIcon(strokePath('M12 6v12M6 12h12'))}</button><button type="button" data-info aria-expanded="false" aria-label="图片信息">${svgIcon(strokePath('M12 11v5M12 8h.01') + '<circle cx="12" cy="12" r="9"></circle>')}</button>`;
+  viewerTools.innerHTML = `<button type="button" data-zoom="out" aria-label="缩小">${svgIcon(strokePath('M6 12h12'))}</button><button type="button" data-view="fit" aria-label="适应窗口">适屏</button><button type="button" data-view="fill" aria-label="填满窗口">填满</button><button type="button" data-view="actual" aria-label="原始尺寸">1:1</button><button type="button" data-zoom="in" aria-label="放大">${svgIcon(strokePath('M12 6v12M6 12h12'))}</button><button type="button" data-info aria-expanded="false" aria-label="图片信息">${svgIcon(strokePath('M12 11v5M12 8h.01') + '<circle cx="12" cy="12" r="9"></circle>')}</button>`;
   const shortcutHelpToggle = document.createElement('button');
   shortcutHelpToggle.type = 'button';
   shortcutHelpToggle.className = 'shortcut-help-toggle';
   shortcutHelpToggle.innerHTML = svgIcon(strokePath('M9.7 9a2.5 2.5 0 1 1 3.9 2.1c-1 .7-1.6 1.2-1.6 2.4M12 17h.01') + '<circle cx="12" cy="12" r="9"></circle>');
-  shortcutHelpToggle.title = '查看快捷键 (?)';
+  shortcutHelpToggle.title = '查看快捷键';
   shortcutHelpToggle.setAttribute('aria-label', shortcutHelpToggle.title);
   viewerExtras.append(viewerTools, shortcutHelpToggle);
   const imageInfo = document.createElement('aside');
@@ -2733,7 +2733,7 @@ if (galleryToggle) {
   const shortcutHelp = document.createElement('aside');
   shortcutHelp.className = 'shortcut-help';
   shortcutHelp.hidden = true;
-  shortcutHelp.innerHTML = '<span>← → / J K 切图</span><span>F 点赞 · C 评论 · D / M 标记删除 · Ctrl K 直接删除</span><span>＋ − 缩放 · 0 适屏 · 1 原尺寸</span><span>I 图片信息 · P 轮播 · 空格暂停</span><span>Esc 退出</span>';
+  shortcutHelp.innerHTML = '<span>← → / J K 切图</span><span>F 点赞 · C 评论 · D 标记删除 · Ctrl K 直接删除</span><span>P 轮播 · 空格暂停</span><span>Esc 退出</span>';
   const figure = lightbox.querySelector('figure');
   figure.append(imageInfo, shortcutHelp);
   previewPrevious.innerHTML = svgIcon(strokePath('m15 6-6 6 6 6'));
@@ -2846,7 +2846,7 @@ if (galleryToggle) {
   const updateDeletionControls = () => {
     const marked = previewTrigger?.dataset.deletionMarked === 'true';
     deletionToggle.setAttribute('aria-pressed', String(marked));
-    deletionToggle.title = marked ? '取消标记 (m)' : '标记删除 (m)';
+    deletionToggle.title = marked ? '取消标记 (d)' : '标记删除 (d)';
     deletionToggle.setAttribute('aria-label', deletionToggle.title);
     deletionToggle.disabled = marking;
     const count = markedEntries().length;
@@ -4172,41 +4172,6 @@ if (galleryToggle) {
       toggleDeletionMark();
       return;
     }
-    if (event.key === '+' || event.key === '=') {
-      event.preventDefault();
-      setZoom(zoom.scale * 1.25);
-      return;
-    }
-    if (event.key === '-') {
-      event.preventDefault();
-      setZoom(zoom.scale / 1.25);
-      return;
-    }
-    if (event.key === '0') {
-      event.preventDefault();
-      setViewMode('fit');
-      return;
-    }
-    if (event.key === '1') {
-      event.preventDefault();
-      setViewMode('actual');
-      return;
-    }
-    if (event.key.toLowerCase() === 'i') {
-      event.preventDefault();
-      imageInfo.hidden = !imageInfo.hidden;
-      viewerTools.querySelector('[data-info]').setAttribute('aria-expanded', String(!imageInfo.hidden));
-      updateImageInfo();
-      showChrome();
-      return;
-    }
-    if (event.key === '?') {
-      event.preventDefault();
-      shortcutHelp.hidden = !shortcutHelp.hidden;
-      shortcutHelpToggle.setAttribute('aria-expanded', String(!shortcutHelp.hidden));
-      showChrome();
-      return;
-    }
     if (event.key === ' ' && lightbox.classList.contains('carousel-mode')) {
       event.preventDefault();
       carouselPaused = !carouselPaused;
@@ -4231,12 +4196,6 @@ if (galleryToggle) {
       if (event.repeat || event.target.closest('input, textarea, select') || event.target.isContentEditable) return;
       event.preventDefault();
       toggleGalleryComments();
-      return;
-    }
-    if (event.key === 'm') {
-      if (event.repeat || event.target.closest('input, textarea, select') || event.target.isContentEditable) return;
-      event.preventDefault();
-      toggleDeletionMark();
       return;
     }
     let direction;
@@ -6920,7 +6879,7 @@ mod tests {
         assert!(page.contains("image-lightbox.carousel-mode"));
         assert!(page.contains("document.addEventListener('visibilitychange'"));
         assert!(page.contains("deletionToggle.innerHTML = svgIcon"));
-        assert!(page.contains("marked ? '取消标记 (m)' : '标记删除 (m)'"));
+        assert!(page.contains("marked ? '取消标记 (d)' : '标记删除 (d)'"));
         assert!(page.contains("id=\"deletion-filter\""));
         assert!(page.contains("id=\"delete-marked-images\""));
         assert!(page.contains(
@@ -6930,7 +6889,6 @@ mod tests {
         assert!(page.contains("?mode=clear-deletion-marks"));
         assert!(page.contains("moveFavouriteButton.hidden = enabled"));
         assert!(page.contains("id=\"delete-marked-dialog\""));
-        assert!(page.contains("if (event.key === 'm')"));
         assert!(page.contains("?mode=deletion-mark"));
         assert!(page.contains("?mode=delete-marked"));
         assert!(page.contains("lightboxClose.addEventListener('click', closeLightbox)"));

@@ -74,6 +74,18 @@ test('secondary viewer tools stay hidden until More is opened', async ({page}) =
   await expect(page.locator('.viewer-more-toggle')).toHaveAttribute('aria-expanded', 'true');
   await expect(page.locator('.viewer-extras')).toBeVisible();
   await expect(page.locator('[data-view="fit"]')).toBeVisible();
+  await page.locator('[data-zoom="in"]').click();
+  await expect.poll(() => page.locator('.lightbox-image').evaluate(image => image.style.transform)).toContain('scale(1.25)');
+  await page.locator('[data-view="fit"]').click();
+  await expect.poll(() => page.locator('.lightbox-image').evaluate(image => image.style.transform)).toContain('scale(1)');
+  await page.locator('[data-info]').click();
+  await expect(page.locator('.image-info')).toBeVisible();
+  await page.locator('[data-info]').click();
+  await expect(page.locator('.image-info')).toBeHidden();
+  await page.locator('.shortcut-help-toggle').click();
+  await expect(page.locator('.shortcut-help')).toBeVisible();
+  await page.locator('.shortcut-help-toggle').click();
+  await expect(page.locator('.shortcut-help')).toBeHidden();
 
   await page.keyboard.press('Escape');
   await expect(page.locator('.viewer-extras')).toBeHidden();
@@ -111,7 +123,7 @@ test('hidden viewer controls expose live favourite and deletion state on the ima
   await expect(page.locator('#favourite-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(heart).toHaveClass(/liked/);
   await expect(heart).toBeVisible();
-  await page.keyboard.press('m');
+  await page.keyboard.press('d');
   await expect(page.locator('#deletion-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(deletion).toBeVisible();
   await expect(state).toHaveCSS('opacity', '1');
