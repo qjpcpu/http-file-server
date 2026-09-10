@@ -1,6 +1,37 @@
 const { test, expect } = require('@playwright/test');
 const { dispatchTouchPointer, openGalleryImage } = require('./helpers');
 
+test('mobile directory favourites keep every shortcut reachable without overlapping folder stars', async ({page}) => {
+  test.skip(page.viewportSize().width > 650, 'phone layout only');
+  for (const suffix of ['', '-2', '-3', '-4']) {
+    await page.request.delete(`/shortcut-folder${suffix}/?mode=directory-favourite`);
+    await page.request.put(`/shortcut-folder${suffix}/?mode=directory-favourite`);
+  }
+
+  await page.goto('/');
+  await expect(page.locator('.directory-favourites-list .directory-favourite')).toHaveCount(1);
+  await expect(page.locator('.directory-favourites-more')).toBeVisible();
+  await page.locator('.directory-favourites-more summary').click();
+  await expect(page.locator('.directory-favourites-menu .directory-favourite')).toHaveCount(3);
+  for (const item of await page.locator('.directory-favourites-menu .directory-favourite').all()) {
+    await expect(item).toBeVisible();
+  }
+
+  const folderControls = await page.locator('.entry.folder').evaluateAll(entries => entries.map(entry => {
+    const name = entry.querySelector('.entry-name').getBoundingClientRect();
+    const star = entry.querySelector('.folder-favourite-toggle').getBoundingClientRect();
+    return {
+      overlap: name.left < star.right && name.right > star.left && name.top < star.bottom && name.bottom > star.top,
+      detailVisible: getComputedStyle(entry.querySelector('.detail')).display !== 'none'
+    };
+  }));
+  expect(folderControls.every(({overlap, detailVisible}) => !overlap && !detailVisible)).toBe(true);
+
+  for (const suffix of ['', '-2', '-3', '-4']) {
+    await page.request.delete(`/shortcut-folder${suffix}/?mode=directory-favourite`);
+  }
+});
+
 test('screen-wide vertical swipe hands off without snapping back', async ({page}) => {
   await openGalleryImage(page);
   await expect(page.locator('#image-lightbox')).toHaveClass(/chrome-hidden/);
