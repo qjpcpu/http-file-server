@@ -43,6 +43,9 @@ const MERMAID_JS: &[u8] = include_bytes!("../assets/mermaid-11.17.2.min.js");
 const MARKDOWN_MERMAID_JS: &str = include_str!("../assets/markdown-mermaid.js");
 const YJS_PATH: &str = "/__webdir/yjs-13.6.32.min.js";
 const YJS_JS: &[u8] = include_bytes!("../assets/yjs-13.6.32.min.js");
+const AUTH_PATH: &str = "/__webdir/auth";
+const INVALID_ACCESS_PATH: &str = "/__webdir/invalid-access";
+const AUTH_COOKIE_NAME: &str = "webdir_auth_token";
 
 #[derive(Debug, PartialEq)]
 struct PortConfig {
@@ -52,6 +55,7 @@ struct PortConfig {
     raw: bool,
     cache_dir: Option<PathBuf>,
     serve_dir: PathBuf,
+    auth_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -61,6 +65,8 @@ struct RequestHeaders {
     if_none_match: String,
     fetch_dest: String,
     connection: String,
+    cookie: String,
+    auth_token: String,
     upgrade: String,
     websocket_key: String,
     websocket_version: String,
@@ -132,8 +138,9 @@ fn main() {
                 let root = root.clone();
                 let collaboration = collaboration.clone();
                 let reviews = reviews.clone();
+                let auth_token = port_config.auth_token.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = handle_connection(
+                    if let Err(error) = handle_connection_with_auth(
                         stream,
                         &root,
                         &collaboration,
@@ -141,6 +148,7 @@ fn main() {
                         port_config.raw,
                         image_cache.as_ref(),
                         &state,
+                        auth_token.as_deref(),
                     ) {
                         eprintln!("请求处理失败: {error}");
                     }
@@ -161,6 +169,7 @@ where
     let mut raw = false;
     let mut cache_dir = None;
     let mut serve_dir = PathBuf::from(".");
+    let mut auth_token = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--port" => {
@@ -193,6 +202,13 @@ where
                 serve_dir = PathBuf::from(value);
             }
             "--raw" => raw = true,
+            "--auth-token" => {
+                let value = args.next().ok_or_else(|| format!("{arg} 后需要 token"))?;
+                if value.is_empty() {
+                    return Err("认证 token 不能为空".into());
+                }
+                auth_token = Some(value);
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 return Ok(None);
@@ -207,6 +223,7 @@ where
         raw,
         cache_dir,
         serve_dir,
+        auth_token,
     }))
 }
 
@@ -220,14 +237,36 @@ fn bind_listener(config: &PortConfig) -> io::Result<TcpListener> {
 }
 
 fn usage() -> &'static str {
-    "用法: webdir [-p PORT] [-pid FILE] [-cache DIR] [-dir DIR] [--raw]\n\n选项:\n  -p, --port PORT    指定监听端口（默认 8080）\n  -pid, --pid FILE   将启动进程 PID 写入指定文件\n  -cache, --cache DIR 指定缓存根目录（缩略图、点赞和待删除标记存入 DIR）\n  -dir, --dir DIR    指定托管目录（默认当前目录）\n  --raw             以原始静态网站服务器模式运行\n  -h, --help         显示帮助"
+    "用法: webdir [-p PORT] [-pid FILE] [-cache DIR] [-dir DIR] [--auth-token TOKEN] [--raw]\n\n选项:\n  -p, --port PORT      指定监听端口（默认 8080）\n  -pid, --pid FILE     将启动进程 PID 写入指定文件\n  -cache, --cache DIR   指定缓存根目录（缩略图、点赞和待删除标记存入 DIR）\n  -dir, --dir DIR      指定托管目录（默认当前目录）\n  --auth-token TOKEN   为所有访问启用 token 认证\n  --raw                以原始静态网站服务器模式运行\n  -h, --help           显示帮助"
 }
 
 fn write_pid_file(path: &Path) -> io::Result<()> {
     fs::write(path, format!("{}\n", std::process::id()))
 }
 
+#[cfg(test)]
 fn handle_connection(
+    stream: TcpStream,
+    root: &Path,
+    collaboration: &CollaborationHub,
+    reviews: &ReviewHub,
+    raw: bool,
+    image_cache: Option<&ImageCache>,
+    state: &StateStore,
+) -> io::Result<()> {
+    handle_connection_with_auth(
+        stream,
+        root,
+        collaboration,
+        reviews,
+        raw,
+        image_cache,
+        state,
+        None,
+    )
+}
+
+fn handle_connection_with_auth(
     mut stream: TcpStream,
     root: &Path,
     collaboration: &CollaborationHub,
@@ -235,6 +274,7 @@ fn handle_connection(
     raw: bool,
     image_cache: Option<&ImageCache>,
     state: &StateStore,
+    auth_token: Option<&str>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -245,7 +285,9 @@ fn handle_connection(
     let target = parts.next().unwrap_or("");
     let head_only = method == "HEAD";
 
-    if (raw && !matches!(method, "GET" | "HEAD"))
+    if (raw
+        && !matches!(method, "GET" | "HEAD")
+        && !(method == "POST" && target.split('?').next() == Some(AUTH_PATH)))
         || (!raw && !matches!(method, "GET" | "HEAD" | "POST" | "PUT" | "DELETE"))
     {
         return send_text(
@@ -277,6 +319,60 @@ fn handle_connection(
 
     let (request_path, query) = target.split_once('?').unwrap_or((target, ""));
     let request_path = request_path.split('#').next().unwrap_or("/");
+    if let Some(expected_token) = auth_token {
+        if request_path == AUTH_PATH && method == "POST" {
+            return if headers.auth_token == expected_token {
+                send_authenticated(&mut stream, expected_token, head_only)
+            } else {
+                send_html_status(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    &render_invalid_access_page(),
+                    head_only,
+                )
+            };
+        }
+        if request_path == INVALID_ACCESS_PATH && matches!(method, "GET" | "HEAD") {
+            return send_html_status(
+                &mut stream,
+                403,
+                "Forbidden",
+                &render_invalid_access_page(),
+                head_only,
+            );
+        }
+        match cookie_value(&headers.cookie, AUTH_COOKIE_NAME) {
+            Some(token) if token == expected_token => {}
+            Some(_) => {
+                return send_html_status(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    &render_invalid_access_page(),
+                    head_only,
+                )
+            }
+            None if matches!(method, "GET" | "HEAD") && request_wants_html(&headers) => {
+                return send_html_status(
+                    &mut stream,
+                    401,
+                    "Unauthorized",
+                    &render_auth_page(target),
+                    head_only,
+                )
+            }
+            None => {
+                return send_html_status(
+                    &mut stream,
+                    401,
+                    "Unauthorized",
+                    &render_invalid_access_page(),
+                    head_only,
+                )
+            }
+        }
+    }
     if raw {
         return handle_raw_request(&mut stream, root, request_path, query, head_only);
     }
@@ -334,7 +430,7 @@ fn handle_connection(
     };
 
     let canonical = match fs::canonicalize(root.join(&relative)) {
-        Ok(path) if path.starts_with(root) => path,
+        Ok(path) if path.starts_with(root) || traverses_directory_symlink(root, &relative) => path,
         Ok(_) => return send_text(&mut stream, 403, "Forbidden", "禁止访问\n", head_only),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let body = render_not_found_page(&decoded);
@@ -344,6 +440,27 @@ fn handle_connection(
     };
 
     let metadata = fs::metadata(&canonical)?;
+    if mode.as_deref() == Some("directory-favourite") {
+        if !matches!(method, "PUT" | "DELETE") || !metadata.is_dir() {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "仅支持收藏或取消收藏目录\n",
+                head_only,
+            );
+        }
+        return match state.set_directory_favourite(&root.join(&relative), method == "PUT") {
+            Ok(()) => send_empty(&mut stream, 204, "No Content"),
+            Err(_) => send_text(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                "保存目录收藏失败，请重试。\n",
+                false,
+            ),
+        };
+    }
     if mode.as_deref() == Some("move-favourites") {
         if method != "POST" || !metadata.is_dir() {
             return send_text(
@@ -495,7 +612,7 @@ fn handle_connection(
             };
             return send_redirect(&mut stream, &location);
         }
-        let body = render_directory_page(root, &canonical, state)?;
+        let body = render_directory_page_at(root, &canonical, &relative, state)?;
         return send_html(&mut stream, &body, head_only);
     }
     if !metadata.is_file() {
@@ -895,8 +1012,8 @@ fn handle_raw_request(
         Some(path) => path,
         None => return send_text(stream, 403, "Forbidden", "禁止访问\n", head_only),
     };
-    let canonical = match fs::canonicalize(root.join(relative)) {
-        Ok(path) if path.starts_with(root) => path,
+    let canonical = match fs::canonicalize(root.join(&relative)) {
+        Ok(path) if path.starts_with(root) || traverses_directory_symlink(root, &relative) => path,
         Ok(_) => return send_text(stream, 403, "Forbidden", "禁止访问\n", head_only),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return send_text(stream, 404, "Not Found", "Not Found\n", head_only)
@@ -915,7 +1032,7 @@ fn handle_raw_request(
             return send_redirect(stream, &location);
         }
         let index = match fs::canonicalize(canonical.join("index.html")) {
-            Ok(path) if path.starts_with(root) => path,
+            Ok(path) if path.starts_with(&canonical) => path,
             Ok(_) => return send_text(stream, 403, "Forbidden", "Forbidden\n", head_only),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return send_text(stream, 403, "Forbidden", "Forbidden\n", head_only)
@@ -1058,6 +1175,10 @@ fn read_request_headers<R: BufRead>(reader: &mut R) -> io::Result<RequestHeaders
                 headers.fetch_dest = value.trim().to_ascii_lowercase();
             } else if name.eq_ignore_ascii_case("connection") {
                 headers.connection = value.trim().to_ascii_lowercase();
+            } else if name.eq_ignore_ascii_case("cookie") {
+                headers.cookie = value.trim().to_owned();
+            } else if name.eq_ignore_ascii_case("x-webdir-auth-token") {
+                headers.auth_token = value.trim().to_owned();
             } else if name.eq_ignore_ascii_case("upgrade") {
                 headers.upgrade = value.trim().to_ascii_lowercase();
             } else if name.eq_ignore_ascii_case("sec-websocket-key") {
@@ -1088,6 +1209,53 @@ fn is_websocket_upgrade(headers: &RequestHeaders) -> bool {
 fn request_wants_html(headers: &RequestHeaders) -> bool {
     headers.fetch_dest == "document" || headers.accept.contains("text/html")
 }
+
+fn cookie_value<'a>(cookie: &'a str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| percent_decode(value)).flatten()
+    })
+}
+
+fn send_authenticated(stream: &mut TcpStream, token: &str, head_only: bool) -> io::Result<()> {
+    let cookie = percent_encode_component(token);
+    write!(
+        stream,
+        "HTTP/1.1 204 No Content\r\nSet-Cookie: {AUTH_COOKIE_NAME}={cookie}; Path=/; HttpOnly; SameSite=Lax\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )?;
+    let _ = head_only;
+    Ok(())
+}
+
+fn render_auth_page(target: &str) -> String {
+    let target = serde_json::to_string(target).unwrap();
+    render_auth_shell(
+        "需要访问令牌",
+        "这个工作区已开启访问保护。输入令牌后即可继续。",
+        &target,
+        true,
+    )
+}
+
+fn render_invalid_access_page() -> String {
+    render_auth_shell(
+        "访问未获授权",
+        "令牌无效，或该服务已使用新的访问令牌重启。请重新验证后回到根目录。",
+        "\"/\"",
+        false,
+    )
+}
+
+fn render_auth_shell(title: &str, description: &str, target: &str, auto_submit: bool) -> String {
+    let auto_submit = if auto_submit { "true" } else { "false" };
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{title} · webdir</title><style>{AUTH_PAGE_CSS}</style></head><body><main><section class=\"auth-card\"><div class=\"lock\" aria-hidden=\"true\">⌁</div><p class=\"eyebrow\">WEBDIR / PROTECTED</p><h1>{title}</h1><p>{description}</p><form id=\"auth-form\"><label for=\"auth-token\">访问令牌</label><div class=\"token-row\"><input id=\"auth-token\" type=\"password\" autocomplete=\"current-password\" required autofocus><button>验证并继续</button></div><p id=\"auth-error\" role=\"alert\" hidden></p></form></section></main><script>const key='webdir-auth-token',target={target},form=document.querySelector('#auth-form'),input=document.querySelector('#auth-token'),error=document.querySelector('#auth-error');async function verify(token,save){{error.hidden=true;const response=await fetch('{AUTH_PATH}',{{method:'POST',headers:{{'X-Webdir-Auth-Token':token}}}});if(response.ok){{if(save)localStorage.setItem(key,token);location.replace(target);return}}location.replace('{INVALID_ACCESS_PATH}')}};form.addEventListener('submit',event=>{{event.preventDefault();verify(input.value,true)}});const saved=localStorage.getItem(key);if({auto_submit}&&saved)verify(saved,false);</script></body></html>"
+    )
+}
+
+const AUTH_PAGE_CSS: &str = r#"
+:root { color-scheme:light dark; --paper:#f4f5fb; --surface:#fff; --ink:#202333; --muted:#73788b; --line:#dfe3ee; --accent:#5b5bd6; --accent-soft:#eeeeff; } * { box-sizing:border-box; } body { min-height:100vh; margin:0; display:grid; place-items:center; color:var(--ink); background:radial-gradient(circle at 15% 15%,#dedfff 0,transparent 26rem),var(--paper); font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif; } main { width:min(100% - 2rem,34rem); } .auth-card { position:relative; overflow:hidden; padding:clamp(2rem,7vw,4rem); border:1px solid var(--line); border-radius:1.4rem; background:color-mix(in srgb,var(--surface) 92%,transparent); box-shadow:0 26px 70px rgba(54,59,92,.16); } .auth-card::after { position:absolute; right:-2.5rem; bottom:-3rem; width:11rem; height:11rem; border:1.5rem solid var(--accent-soft); border-radius:2.5rem; content:""; transform:rotate(22deg); } .lock { display:grid; place-items:center; width:3rem; height:3rem; margin-bottom:1.5rem; border-radius:1rem; color:var(--accent); background:var(--accent-soft); font-size:2rem; } .eyebrow { margin:0 0 .75rem; color:var(--accent); font:700 .72rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.14em; } h1 { margin:0; font-family:"Iowan Old Style","Noto Serif SC",Georgia,serif; font-size:clamp(2rem,8vw,3.5rem); letter-spacing:-.05em; } h1+p { position:relative; z-index:1; margin:1rem 0 2rem; color:var(--muted); line-height:1.7; } form { position:relative; z-index:1; } label { display:block; margin-bottom:.55rem; font-size:.8rem; font-weight:700; } .token-row { display:flex; gap:.55rem; } input { min-width:0; flex:1; padding:.8rem .9rem; border:1px solid var(--line); border-radius:.65rem; color:var(--ink); background:var(--paper); font:inherit; } button { flex:0 0 auto; padding:.8rem 1rem; border:0; border-radius:.65rem; color:#fff; background:var(--accent); font:700 .8rem/1 ui-sans-serif,sans-serif; cursor:pointer; } button:hover { filter:brightness(1.08); } #auth-error { color:#b42336; } @media (max-width:500px) { .token-row { display:grid; } button { min-height:2.8rem; } } @media (prefers-color-scheme:dark) { :root { --paper:#11131b; --surface:#191c27; --ink:#edf0f7; --muted:#969daf; --line:#303545; --accent:#a9a5ff; --accent-soft:#292943; } body { background:radial-gradient(circle at 15% 15%,#292943 0,transparent 26rem),var(--paper); } }
+"#;
 
 fn read_request_body<R: Read>(reader: &mut R, length: usize) -> Result<String, String> {
     let mut body = vec![0; length];
@@ -1235,6 +1403,7 @@ struct DirectoryEntry {
     image_version: Option<String>,
     favourite: bool,
     deletion_marked: bool,
+    directory_favourite: bool,
 }
 
 #[derive(Default, serde::Serialize)]
@@ -1435,8 +1604,75 @@ fn render_breadcrumbs(relative: &Path) -> String {
     breadcrumbs
 }
 
+fn render_directory_favourites(
+    root: &Path,
+    directory: &Path,
+    state: &StateStore,
+) -> io::Result<String> {
+    let favourites = state.directory_favourites_within(root)?;
+    if favourites.is_empty() {
+        return Ok(String::new());
+    }
+    let mut items = String::new();
+    let mut more_items = String::new();
+    for (index, path) in favourites.iter().enumerate() {
+        let relative = path.strip_prefix(root).unwrap_or(Path::new(""));
+        let href = url_for_path(relative, true);
+        let label = if relative.as_os_str().is_empty() {
+            "root".to_string()
+        } else {
+            relative.to_string_lossy().into_owned()
+        };
+        let label_html = if let Some(name) = relative.file_name() {
+            let parent = relative.parent().unwrap_or(Path::new(""));
+            if parent.as_os_str().is_empty() {
+                escape_html(&label)
+            } else {
+                format!(
+                    "<span class=\"directory-favourite-prefix\">{}</span><span class=\"directory-favourite-separator\">/</span><span class=\"directory-favourite-leaf\">{}</span>",
+                    escape_html(&parent.to_string_lossy()),
+                    escape_html(&name.to_string_lossy())
+                )
+            }
+        } else {
+            escape_html(&label)
+        };
+        let active = if path == directory {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
+        let item = format!(
+            "<span class=\"directory-favourite\" data-directory-favourite-path=\"{href}\"><a href=\"{href}\"{active} title=\"{label}\">{label_html}</a><button type=\"button\" data-directory-favourite-remove=\"{href}\" aria-label=\"移出收藏夹：{label}\" title=\"移出收藏夹\">×</button></span>"
+        );
+        if index < 3 {
+            items.push_str(&item);
+        } else {
+            more_items.push_str(&item);
+        }
+    }
+    let more = if favourites.len() > 3 {
+        format!("<details class=\"directory-favourites-more\"><summary aria-label=\"展开更多收藏目录\"><span>更多</span><svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"m4.5 6 3.5 3.5L11.5 6\"/></svg></summary><div class=\"directory-favourites-menu\">{more_items}</div></details>")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "<nav class=\"directory-favourites\" aria-label=\"收藏目录\"><span class=\"directory-favourites-label\">收藏夹</span><div class=\"directory-favourites-list\">{items}</div>{more}</nav>"
+    ))
+}
+
+#[cfg(test)]
 fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> io::Result<String> {
     let relative = directory.strip_prefix(root).unwrap_or(Path::new(""));
+    render_directory_page_at(root, directory, relative, state)
+}
+
+fn render_directory_page_at(
+    root: &Path,
+    directory: &Path,
+    relative: &Path,
+    state: &StateStore,
+) -> io::Result<String> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -1446,10 +1682,13 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
             continue;
         }
         let file_type = entry.file_type()?;
-        let metadata = entry.metadata().ok();
+        let metadata = fs::metadata(entry.path()).ok();
+        let is_dir = metadata
+            .as_ref()
+            .map_or_else(|| file_type.is_dir(), fs::Metadata::is_dir);
         let is_image = metadata.as_ref().is_some_and(|metadata| metadata.is_file())
             && is_image_file(&entry.path());
-        let canonical = is_image
+        let canonical = (is_image || is_dir)
             .then(|| fs::canonicalize(entry.path()))
             .transpose()?;
         let favourite = match canonical.as_deref() {
@@ -1460,6 +1699,8 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
             Some(path) => state.is_deletion_marked(path)?,
             None => false,
         };
+        let directory_favourite =
+            is_dir && state.is_directory_favourite(&root.join(relative).join(entry.file_name()))?;
         let image_version = canonical
             .as_deref()
             .zip(metadata.as_ref())
@@ -1467,13 +1708,12 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
         entries.push(DirectoryEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry.path(),
-            is_dir: metadata
-                .as_ref()
-                .map_or_else(|| file_type.is_dir(), fs::Metadata::is_dir),
+            is_dir,
             size: metadata.as_ref().map_or(0, fs::Metadata::len),
             image_version,
             favourite,
             deletion_marked,
+            directory_favourite,
         });
     }
     entries.sort_by(|left, right| {
@@ -1498,11 +1738,14 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
         .unwrap_or("根目录");
 
     let breadcrumbs = render_breadcrumbs(relative);
+    let logical_directory = root.join(relative);
+    let directory_favourites = render_directory_favourites(root, &logical_directory, state)?;
+    let directory_favourite = state.is_directory_favourite(&logical_directory)?;
 
     let mut rows = String::new();
     for entry in entries {
-        let entry_relative = entry.path.strip_prefix(root).unwrap_or(&entry.path);
-        let href = url_for_path(entry_relative, entry.is_dir);
+        let entry_relative = relative.join(&entry.name);
+        let href = url_for_path(&entry_relative, entry.is_dir);
         let name = escape_html(&entry.name);
         let (kind, detail) = if entry.is_dir {
             ("dir".to_string(), "目录".to_string())
@@ -1578,9 +1821,21 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
         } else {
             String::new()
         };
-        rows.push_str(&format!(
-            "<a class=\"entry {class}\" href=\"{href}\"{preview}>{glyph}<span class=\"entry-name\">{name}</span><span class=\"kind\">{kind}</span><span class=\"detail\">{detail}</span><span class=\"arrow\" aria-hidden=\"true\">→</span></a>"
-        ));
+        if entry.is_dir {
+            let (star, label) = if entry.directory_favourite {
+                ("★", "移出收藏夹")
+            } else {
+                ("☆", "添加到收藏夹")
+            };
+            rows.push_str(&format!(
+                "<div class=\"entry {class}\"><a class=\"folder-open\" href=\"{href}\">{glyph}<span class=\"entry-name\">{name}</span><span class=\"kind\">{kind}</span><span class=\"detail\">{detail}</span><span class=\"arrow\" aria-hidden=\"true\">→</span></a><button class=\"folder-favourite-toggle\" type=\"button\" data-directory-favourite-toggle=\"{href}\" aria-pressed=\"{}\" aria-label=\"{label}：{name}\" title=\"{label}\">{star}</button></div>",
+                entry.directory_favourite
+            ));
+        } else {
+            rows.push_str(&format!(
+                "<a class=\"entry {class}\" href=\"{href}\"{preview}>{glyph}<span class=\"entry-name\">{name}</span><span class=\"kind\">{kind}</span><span class=\"detail\">{detail}</span><span class=\"arrow\" aria-hidden=\"true\">→</span></a>"
+            ));
+        }
     }
     let empty_hidden = if rows.is_empty() { "" } else { " hidden" };
     rows.push_str(&format!(
@@ -1599,8 +1854,15 @@ fn render_directory_page(root: &Path, directory: &Path, state: &StateStore) -> i
     } else {
         ""
     };
+    let directory_favourite_toggle = if directory == root {
+        ""
+    } else if directory_favourite {
+        "<button class=\"directory-favourite-toggle\" id=\"directory-favourite-toggle\" type=\"button\" aria-pressed=\"true\">移出收藏夹</button>"
+    } else {
+        "<button class=\"directory-favourite-toggle\" id=\"directory-favourite-toggle\" type=\"button\" aria-pressed=\"false\">添加到收藏夹</button>"
+    };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav><header><p class=\"eyebrow\">WEBDIR / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><nav class=\"scroll-jumps\" id=\"scroll-jumps\" aria-label=\"页面快速跳转\" hidden><button id=\"scroll-to-top\" type=\"button\" aria-label=\"回到顶部\" title=\"回到顶部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 14 6-6 6 6\"></path><path d=\"M6 19h12\"></path></svg></button><button id=\"scroll-to-bottom\" type=\"button\" aria-label=\"回到底部\" title=\"回到底部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 10 6 6 6-6\"></path><path d=\"M6 5h12\"></path></svg></button></nav><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><div class=\"lightbox-shell\"><div class=\"lightbox-position\" id=\"lightbox-position\" aria-live=\"polite\"></div><nav class=\"lightbox-filmstrip\" id=\"lightbox-filmstrip\" aria-label=\"图片缩略图导航\"></nav><figure><div class=\"lightbox-stage\"><img class=\"lightbox-image\" alt=\"\"><div class=\"favourite-burst\" id=\"favourite-burst\" aria-hidden=\"true\" hidden><svg viewBox=\"0 0 24 24\"><path d=\"M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z\"></path></svg></div></div><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (d)\" aria-pressed=\"false\" title=\"标记待删除 (d)\">标记删除</button><button class=\"carousel-toggle\" id=\"carousel-toggle\" type=\"button\" aria-label=\"进入轮播 (p)\" aria-pressed=\"false\" title=\"进入轮播 (p)\">轮播</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure></div>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
+        "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n<title>{title} · 文件浏览</title>\n<style>{DIRECTORY_CSS}</style>\n</head>\n<body>\n<main><nav class=\"breadcrumbs\" aria-label=\"当前位置\">{breadcrumbs}</nav>{directory_favourites}<header><p class=\"eyebrow\">WEBDIR / DIRECTORY</p><h1>{title}</h1><p class=\"summary\">{directory_count} 个目录 · {file_count} 个文件</p>{directory_favourite_toggle}{gallery_toggle}<input class=\"directory-search\" id=\"directory-search\" type=\"search\" aria-label=\"搜索文件名\" placeholder=\"搜索当前目录的文件名…\" autocomplete=\"off\">{gallery_tools}<p class=\"directory-notice\" id=\"directory-notice\" role=\"status\" hidden></p></header><section class=\"listing\" aria-label=\"目录内容\">{rows}</section></main><nav class=\"scroll-jumps\" id=\"scroll-jumps\" aria-label=\"页面快速跳转\" hidden><button id=\"scroll-to-top\" type=\"button\" aria-label=\"回到顶部\" title=\"回到顶部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 14 6-6 6 6\"></path><path d=\"M6 19h12\"></path></svg></button><button id=\"scroll-to-bottom\" type=\"button\" aria-label=\"回到底部\" title=\"回到底部\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 10 6 6 6-6\"></path><path d=\"M6 5h12\"></path></svg></button></nav><div class=\"image-lightbox\" id=\"image-lightbox\" role=\"dialog\" aria-modal=\"true\" aria-label=\"图片预览\" hidden><button class=\"lightbox-close\" type=\"button\" aria-label=\"关闭图片预览\">×</button><div class=\"lightbox-shell\"><div class=\"lightbox-position\" id=\"lightbox-position\" aria-live=\"polite\"></div><nav class=\"lightbox-filmstrip\" id=\"lightbox-filmstrip\" aria-label=\"图片缩略图导航\"></nav><figure><div class=\"lightbox-stage\"><img class=\"lightbox-image\" alt=\"\"><div class=\"favourite-burst\" id=\"favourite-burst\" aria-hidden=\"true\" hidden><svg viewBox=\"0 0 24 24\"><path d=\"M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.7-7.5 1.1-1.1a5.5 5.5 0 0 0 0-7.8Z\"></path></svg></div></div><figcaption><span class=\"lightbox-name\"></span><span class=\"lightbox-controls\"><button class=\"preview-step\" id=\"preview-previous\" type=\"button\" aria-label=\"上一张\" title=\"上一张\">←</button><button class=\"favourite-toggle\" id=\"favourite-toggle\" type=\"button\" aria-label=\"点赞 (f)\" aria-pressed=\"false\" title=\"点赞 (f)\">♡</button><button class=\"preview-step\" id=\"preview-next\" type=\"button\" aria-label=\"下一张\" title=\"下一张\">→</button><button class=\"deletion-toggle\" id=\"deletion-toggle\" type=\"button\" aria-label=\"标记待删除 (d)\" aria-pressed=\"false\" title=\"标记待删除 (d)\">标记删除</button><button class=\"carousel-toggle\" id=\"carousel-toggle\" type=\"button\" aria-label=\"进入轮播 (p)\" aria-pressed=\"false\" title=\"进入轮播 (p)\">轮播</button></span></figcaption><p class=\"lightbox-error\" id=\"favourite-error\" role=\"status\" hidden></p><p class=\"lightbox-error\" id=\"deletion-mark-error\" role=\"status\" hidden></p></figure></div>{GALLERY_DELETE_DIALOG}</div>{GALLERY_MARKED_DELETE_DIALOG}\n<script>{FILE_SHORTCUT_JS}</script><script>{DIRECTORY_JS}</script>\n</body>\n</html>"
     ))
 }
 
@@ -2580,6 +2842,132 @@ window.addEventListener('beforeunload', () => {
 });
 
 const directoryNotice = document.querySelector('#directory-notice');
+const directoryFavouriteToggle = document.querySelector('#directory-favourite-toggle');
+const favouritePathname = path => new URL(path, location.origin).pathname;
+const favouriteLabel = path => {
+  const parts = favouritePathname(path).split('/').filter(Boolean).map(decodeURIComponent);
+  return parts.length ? parts.join('/') : 'root';
+};
+const createDirectoryFavouriteItem = path => {
+  const item = document.createElement('span');
+  item.className = 'directory-favourite';
+  item.dataset.directoryFavouritePath = favouritePathname(path);
+  const link = document.createElement('a');
+  link.href = path;
+  const parts = favouritePathname(path).split('/').filter(Boolean).map(decodeURIComponent);
+  const label = parts.length ? parts.join('/') : 'root';
+  link.title = label;
+  if (parts.length > 1) {
+    const prefix = document.createElement('span');
+    prefix.className = 'directory-favourite-prefix';
+    prefix.textContent = parts.slice(0, -1).join('/');
+    const separator = document.createElement('span');
+    separator.className = 'directory-favourite-separator';
+    separator.textContent = '/';
+    const leaf = document.createElement('span');
+    leaf.className = 'directory-favourite-leaf';
+    leaf.textContent = parts.at(-1);
+    link.append(prefix, separator, leaf);
+  } else {
+    link.textContent = label;
+  }
+  if (favouritePathname(path) === location.pathname) link.setAttribute('aria-current', 'page');
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.dataset.directoryFavouriteRemove = path;
+  remove.setAttribute('aria-label', `移出收藏夹：${label}`);
+  remove.title = '移出收藏夹';
+  remove.textContent = '×';
+  item.append(link, remove);
+  return item;
+};
+const ensureDirectoryFavourites = () => {
+  let nav = document.querySelector('.directory-favourites');
+  if (nav) return nav;
+  nav = document.createElement('nav');
+  nav.className = 'directory-favourites';
+  nav.setAttribute('aria-label', '收藏目录');
+  nav.innerHTML = '<span class="directory-favourites-label">收藏夹</span><div class="directory-favourites-list"></div>';
+  document.querySelector('.breadcrumbs').insertAdjacentElement('afterend', nav);
+  return nav;
+};
+const ensureDirectoryFavouritesMore = nav => {
+  let more = nav.querySelector('.directory-favourites-more');
+  if (more) return more.querySelector('.directory-favourites-menu');
+  more = document.createElement('details');
+  more.className = 'directory-favourites-more';
+  more.innerHTML = '<summary aria-label="展开更多收藏目录"><span>更多</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 6 3.5 3.5L11.5 6"/></svg></summary><div class="directory-favourites-menu"></div>';
+  nav.append(more);
+  return more.querySelector('.directory-favourites-menu');
+};
+const setDirectoryFavouriteState = (path, favourite) => {
+  const pathname = favouritePathname(path);
+  document.querySelectorAll('[data-directory-favourite-toggle]').forEach(button => {
+    if (favouritePathname(button.dataset.directoryFavouriteToggle) !== pathname) return;
+    button.setAttribute('aria-pressed', String(favourite));
+    button.textContent = favourite ? '★' : '☆';
+    const label = button.closest('.entry').querySelector('.entry-name').textContent;
+    button.title = favourite ? '移出收藏夹' : '添加到收藏夹';
+    button.setAttribute('aria-label', `${button.title}：${label}`);
+  });
+  if (pathname === location.pathname && directoryFavouriteToggle) {
+    directoryFavouriteToggle.setAttribute('aria-pressed', String(favourite));
+    directoryFavouriteToggle.textContent = favourite ? '移出收藏夹' : '添加到收藏夹';
+  }
+  const existing = Array.from(document.querySelectorAll('[data-directory-favourite-remove]'))
+    .filter(button => favouritePathname(button.dataset.directoryFavouriteRemove) === pathname)
+    .map(button => button.closest('.directory-favourite'));
+  if (favourite && !existing.length) {
+    const nav = ensureDirectoryFavourites();
+    const list = nav.querySelector('.directory-favourites-list');
+    if (list.children.length < 3) list.append(createDirectoryFavouriteItem(path));
+    else ensureDirectoryFavouritesMore(nav).append(createDirectoryFavouriteItem(path));
+  } else if (!favourite && existing.length) {
+    const nav = existing[0].closest('.directory-favourites');
+    const removedFromList = existing.some(item => item.closest('.directory-favourites-list'));
+    existing.forEach(item => item.remove());
+    const menu = nav.querySelector('.directory-favourites-menu');
+    if (removedFromList && menu?.firstElementChild) {
+      nav.querySelector('.directory-favourites-list').append(menu.firstElementChild);
+    }
+    if (menu && !menu.children.length) nav.querySelector('.directory-favourites-more').remove();
+    if (!nav.querySelector('[data-directory-favourite-remove]')) nav.remove();
+  }
+};
+const updateDirectoryFavourite = async (path, method, button) => {
+  button.disabled = true;
+  try {
+    const url = new URL(path, location.origin);
+    url.searchParams.set('mode', 'directory-favourite');
+    const response = await fetch(url, {method});
+    if (!response.ok) throw new Error('保存目录收藏失败，请重试。');
+    setDirectoryFavouriteState(path, method === 'PUT');
+    button.disabled = false;
+  } catch (error) {
+    directoryNotice.textContent = error.message;
+    directoryNotice.hidden = false;
+    button.disabled = false;
+  }
+};
+document.addEventListener('click', event => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  if (button === directoryFavouriteToggle) {
+    updateDirectoryFavourite(
+      location.pathname,
+      directoryFavouriteToggle.getAttribute('aria-pressed') === 'true' ? 'DELETE' : 'PUT',
+      button
+    );
+  } else if (button.matches('[data-directory-favourite-toggle]')) {
+    updateDirectoryFavourite(
+      button.dataset.directoryFavouriteToggle,
+      button.getAttribute('aria-pressed') === 'true' ? 'DELETE' : 'PUT',
+      button
+    );
+  } else if (button.matches('[data-directory-favourite-remove]')) {
+    updateDirectoryFavourite(button.dataset.directoryFavouriteRemove, 'DELETE', button);
+  }
+});
 if (history.state?.moveNotice) {
   directoryNotice.textContent = history.state.moveNotice;
   directoryNotice.hidden = false;
@@ -4251,6 +4639,26 @@ main { width:min(100% - 2rem,980px); margin:0 auto; padding:clamp(1.5rem,6vw,5re
 .breadcrumbs { display:flex; align-items:center; gap:.55rem; overflow-x:auto; padding-bottom:1rem; color:var(--muted); font:600 .78rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; scrollbar-width:none; }
 .breadcrumbs a { color:inherit; text-decoration:none; white-space:nowrap; }
 .breadcrumbs a:hover { color:var(--accent); }
+.directory-favourites { display:flex; align-items:center; gap:.45rem; margin:-.35rem 0 1rem; padding:.45rem 0; color:var(--muted); }
+.directory-favourites-label { flex:0 0 auto; padding-right:.15rem; font:700 .68rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.08em; }
+.directory-favourites-list { display:flex; flex:1 1 auto; gap:.45rem; min-width:0; overflow:hidden; }
+.directory-favourites-more { position:relative; flex:0 0 auto; }
+.directory-favourites-more summary { display:flex; align-items:center; gap:.18rem; min-height:1.8rem; padding:.38rem .48rem .38rem .62rem; border:1px solid var(--line); border-radius:.5rem; color:var(--muted); background:var(--surface); font:700 .7rem/1 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif; cursor:pointer; list-style:none; transition:border-color .16s ease,color .16s ease,background-color .16s ease; }
+.directory-favourites-more summary::-webkit-details-marker { display:none; }
+.directory-favourites-more summary:hover,.directory-favourites-more[open] summary { border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
+.directory-favourites-more summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.directory-favourites-more summary svg { width:.9rem; height:.9rem; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; transition:transform .18s ease; }
+.directory-favourites-more[open] summary svg { transform:rotate(180deg); }
+.directory-favourites-menu { position:absolute; z-index:4; top:calc(100% + .45rem); right:0; display:grid; gap:.35rem; width:min(24rem,calc(100vw - 2rem)); max-height:min(60vh,28rem); overflow:auto; padding:.45rem; border:1px solid var(--line); border-radius:.65rem; background:var(--surface); box-shadow:0 12px 28px rgba(27,31,52,.16); }
+.directory-favourites-menu .directory-favourite { width:100%; }
+.directory-favourites-menu .directory-favourite a { max-width:none; flex:1 1 auto; }
+.directory-favourite { flex:0 0 auto; display:flex; overflow:hidden; border:1px solid var(--line); border-radius:.5rem; background:var(--surface); }
+.directory-favourite a { display:flex; align-items:center; max-width:min(15rem,55vw); min-width:0; overflow:hidden; padding:.42rem .25rem .42rem .6rem; color:var(--ink); font:600 .72rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; text-decoration:none; white-space:nowrap; }
+.directory-favourite-prefix { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.directory-favourite-separator,.directory-favourite-leaf { flex:0 0 auto; }
+.directory-favourite a:hover,.directory-favourite a[aria-current="page"] { color:var(--accent); background:var(--accent-soft); }
+.directory-favourite button { width:1.8rem; padding:0; border:0; border-left:1px solid var(--line); color:var(--muted); background:transparent; font-size:1rem; cursor:pointer; }
+.directory-favourite button:hover { color:var(--accent); background:var(--accent-soft); }
 main>header { position:relative; padding:clamp(1.4rem,4vw,2.5rem); overflow:hidden; border:1px solid var(--line); border-radius:1.1rem 1.1rem 0 0; background:var(--surface); }
 main>header::after { position:absolute; right:-1.4rem; bottom:-3.2rem; width:9rem; height:7rem; border:1.1rem solid var(--accent-soft); border-radius:1.2rem; content:""; transform:rotate(-8deg); }
 .view-toggle { position:absolute; z-index:2; right:clamp(1rem,3vw,2rem); top:clamp(1rem,3vw,2rem); display:flex; align-items:center; gap:.45rem; min-height:2.35rem; padding:.55rem .8rem; border:1px solid var(--line); border-radius:.65rem; color:var(--ink); background:var(--surface); box-shadow:0 6px 18px rgba(54,59,92,.08); font:700 .75rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
@@ -4259,6 +4667,9 @@ main>header::after { position:absolute; right:-1.4rem; bottom:-3.2rem; width:9re
 .eyebrow { margin:0 0 .7rem; color:var(--accent); font:700 .72rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.14em; }
 h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family:"Iowan Old Style","Noto Serif SC","Songti SC",Georgia,serif; font-size:clamp(2rem,6vw,3.8rem); line-height:1.08; letter-spacing:-.035em; }
 .summary { position:relative; z-index:1; margin:.8rem 0 0; color:var(--muted); font-size:.88rem; }
+.directory-favourite-toggle { position:relative; z-index:2; min-height:2rem; margin-top:.85rem; padding:.38rem .65rem; border:1px solid var(--line); border-radius:.45rem; color:var(--muted); background:var(--surface); font:600 .72rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }
+.directory-favourite-toggle:hover,.directory-favourite-toggle[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
+.directory-favourite-toggle:disabled { opacity:.5; cursor:wait; }
 .directory-search { position:relative; z-index:1; display:block; width:100%; margin-top:1.25rem; padding:.75rem .9rem; border:1px solid var(--line); border-radius:.65rem; color:var(--ink); background:var(--paper); font:inherit; }
 .directory-search::placeholder { color:var(--muted); }
 .gallery-organise { position:relative; z-index:1; display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:.4rem; margin-top:.75rem; }
@@ -4276,12 +4687,19 @@ h1 { position:relative; z-index:1; margin:0; overflow-wrap:anywhere; font-family
 .entry { display:grid; grid-template-columns:2.55rem minmax(0,1fr) 5rem 6rem 1.5rem; align-items:center; gap:.85rem; min-height:4.25rem; padding:.7rem 1.2rem; border-top:1px solid var(--line); color:var(--ink); text-decoration:none; transition:background .15s ease,transform .18s cubic-bezier(.16,1,.3,1); }
 .entry:first-child { border-top:0; }
 .entry:hover { background:var(--accent-soft); transform:translateX(.2rem); }
+.folder-open { display:contents; color:inherit; text-decoration:none; }
+.folder:focus-within { background:var(--accent-soft); }
+.folder .arrow { display:none; }
+.folder-favourite-toggle { position:absolute; right:1.15rem; display:grid; place-items:center; width:1.8rem; height:1.8rem; padding:0; border:0; border-radius:.45rem; color:var(--muted); background:transparent; font-size:1.25rem; line-height:1; cursor:pointer; }
+.folder-favourite-toggle:hover,.folder-favourite-toggle[aria-pressed="true"] { color:var(--accent); background:var(--accent-soft); }
+.folder-favourite-toggle:disabled { opacity:.5; cursor:wait; }
 .entry-name { overflow:hidden; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
 .kind { justify-self:start; padding:.2rem .45rem; border:1px solid var(--line); border-radius:.3rem; color:var(--muted); font:700 .62rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.04em; }
 .detail { justify-self:end; color:var(--muted); font:500 .75rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .arrow { color:var(--muted); font-size:1.1rem; opacity:0; transform:translateX(-.35rem); transition:opacity .15s ease,transform .15s ease; }
 .entry:hover .arrow { opacity:1; transform:none; }
 .glyph { position:relative; justify-self:center; display:block; width:1.4rem; height:1.2rem; border:2px solid var(--muted); border-radius:.18rem; opacity:.75; }
+.folder { position:relative; }
 .folder .glyph { height:1rem; margin-top:.2rem; border:0; border-radius:.18rem; background:var(--folder); opacity:1; }
 .folder .glyph::before { position:absolute; left:.08rem; top:-.28rem; width:.62rem; height:.38rem; border-radius:.18rem .18rem 0 0; background:var(--folder); content:""; }
 .file .glyph::after { position:absolute; right:-2px; top:-2px; width:.42rem; height:.42rem; border-left:2px solid var(--muted); border-bottom:2px solid var(--muted); background:var(--surface); content:""; }
@@ -5697,6 +6115,22 @@ fn safe_relative_path(path: &str) -> Option<PathBuf> {
     Some(result)
 }
 
+fn traverses_directory_symlink(root: &Path, relative: &Path) -> bool {
+    let mut path = root.to_owned();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        path.push(name);
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+            && fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn percent_decode(input: &str) -> Option<String> {
     let bytes = input.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -5787,6 +6221,7 @@ mod tests {
                 raw: false,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
+                auth_token: None,
             })
         );
         assert_eq!(
@@ -5798,6 +6233,7 @@ mod tests {
                 raw: false,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
+                auth_token: None,
             })
         );
         assert_eq!(
@@ -5818,6 +6254,7 @@ mod tests {
                 raw: false,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
+                auth_token: None,
             })
         );
         assert_eq!(
@@ -5829,9 +6266,107 @@ mod tests {
                 raw: true,
                 cache_dir: None,
                 serve_dir: PathBuf::from("."),
+                auth_token: None,
             })
         );
         assert!(parse_args(vec!["-pid".into()].into_iter()).is_err());
+        assert_eq!(
+            parse_args(vec!["--auth-token".into(), "secret".into()].into_iter())
+                .unwrap()
+                .unwrap()
+                .auth_token,
+            Some("secret".into())
+        );
+        assert!(parse_args(vec!["--auth-token".into(), "".into()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn auth_token_protects_requests_and_uses_a_browser_session_cookie() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        fs::write(root.join("note.txt"), "private").unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let state = StateStore::new(None).unwrap();
+            for _ in 0..5 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection_with_auth(
+                    stream,
+                    &root,
+                    &CollaborationHub::default(),
+                    &ReviewHub::default(),
+                    false,
+                    None,
+                    &state,
+                    Some("secret"),
+                )
+                .unwrap();
+            }
+        });
+        let request = |method: &str, target: &str, headers: &str| {
+            let mut client = TcpStream::connect(address).unwrap();
+            write!(
+                client,
+                "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        let missing = request("GET", "/", "Accept: text/html\r\n");
+        assert!(missing.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(missing.contains("需要访问令牌"));
+        let authenticated = request("POST", AUTH_PATH, "X-Webdir-Auth-Token: secret\r\n");
+        assert!(authenticated.starts_with("HTTP/1.1 204 No Content"));
+        assert!(authenticated.contains("Set-Cookie: webdir_auth_token=secret;"));
+        let allowed = request("GET", "/note.txt", "Cookie: webdir_auth_token=secret\r\n");
+        assert!(allowed.starts_with("HTTP/1.1 200 OK"));
+        assert!(allowed.ends_with("private"));
+        let invalid = request("GET", "/note.txt", "Cookie: webdir_auth_token=wrong\r\n");
+        assert!(invalid.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(invalid.contains("访问未获授权"));
+        let resource = request(
+            "GET",
+            "/favicon.svg",
+            "Cookie: webdir_auth_token=secret\r\n",
+        );
+        assert!(resource.starts_with("HTTP/1.1 200 OK"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn disabled_authentication_ignores_a_stale_browser_cookie() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection_with_auth(
+                stream,
+                &root,
+                &CollaborationHub::default(),
+                &ReviewHub::default(),
+                false,
+                None,
+                &StateStore::new(None).unwrap(),
+                None,
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        write!(
+            client,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: webdir_auth_token=stale\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -5845,6 +6380,7 @@ mod tests {
             raw: false,
             cache_dir: None,
             serve_dir: PathBuf::from("."),
+            auth_token: None,
         })
         .unwrap();
 
@@ -5862,6 +6398,7 @@ mod tests {
             raw: false,
             cache_dir: None,
             serve_dir: PathBuf::from("."),
+            auth_token: None,
         })
         .unwrap_err();
 
@@ -6803,6 +7340,211 @@ mod tests {
     }
 
     #[test]
+    fn directory_favourite_requests_render_and_remove_directory_shortcuts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let state = StateStore::new(None).unwrap();
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection(
+                    stream,
+                    &root,
+                    &CollaborationHub::default(),
+                    &ReviewHub::default(),
+                    false,
+                    None,
+                    &state,
+                )
+                .unwrap();
+            }
+        });
+        let request = |method: &str, target: &str| {
+            let mut client = TcpStream::connect(address).unwrap();
+            write!(
+                client,
+                "{method} {target} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        assert!(request("PUT", "/nested/?mode=directory-favourite").starts_with("HTTP/1.1 204"));
+        let listed = request("GET", "/");
+        assert!(listed.contains("class=\"directory-favourites\""));
+        assert!(listed.contains("href=\"/nested/\" title=\"nested\">nested</a>"));
+        assert!(listed.contains("data-directory-favourite-remove=\"/nested/\""));
+        assert!(
+            listed.contains("data-directory-favourite-toggle=\"/nested/\" aria-pressed=\"true\"")
+        );
+        assert!(request("DELETE", "/nested/?mode=directory-favourite").starts_with("HTTP/1.1 204"));
+        let removed = request("GET", "/");
+        assert!(!removed.contains("class=\"directory-favourites\""));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn directory_favourite_labels_keep_the_last_directory_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let favourite = root.join("projects/very-long-collection-name/final-folder");
+        fs::create_dir_all(&favourite).unwrap();
+        let state = StateStore::new(None).unwrap();
+        state.set_directory_favourite(&favourite, true).unwrap();
+
+        let page = render_directory_page(&root, &root, &state).unwrap();
+
+        assert!(page.contains(
+            "<span class=\"directory-favourite-prefix\">projects/very-long-collection-name</span>"
+        ));
+        assert!(page.contains("<span class=\"directory-favourite-leaf\">final-folder</span>"));
+    }
+
+    #[test]
+    fn directory_favourites_put_additional_entries_in_a_more_menu() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let state = StateStore::new(None).unwrap();
+        for name in ["one", "two", "three", "four"] {
+            let path = root.join(name);
+            fs::create_dir(&path).unwrap();
+            state.set_directory_favourite(&path, true).unwrap();
+        }
+
+        let page = render_directory_page(&root, &root, &state).unwrap();
+
+        assert!(page.contains("<details class=\"directory-favourites-more\">"));
+        assert!(page.contains("<span>更多</span><svg viewBox=\"0 0 16 16\""));
+        assert!(page.contains("<div class=\"directory-favourites-menu\">"));
+        for name in ["one", "two", "three", "four"] {
+            assert_eq!(
+                page.matches(&format!("data-directory-favourite-path=\"/{name}/\""))
+                    .count(),
+                1
+            );
+        }
+        let menu = page
+            .split("class=\"directory-favourites-menu\"")
+            .nth(1)
+            .unwrap();
+        assert!(!menu.contains("data-directory-favourite-path=\"/one/\""));
+        assert!(!menu.contains("data-directory-favourite-path=\"/two/\""));
+        assert!(!menu.contains("data-directory-favourite-path=\"/three/\""));
+        assert!(menu.contains("data-directory-favourite-path=\"/four/\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browses_external_directory_symlinks_with_normal_directory_urls() {
+        use std::os::unix::fs::symlink;
+
+        let served = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fs::create_dir(external.path().join("nested")).unwrap();
+        fs::write(external.path().join("nested/note.txt"), "through symlink").unwrap();
+        symlink(external.path(), served.path().join("Documents")).unwrap();
+        symlink(
+            external.path().join("nested/note.txt"),
+            served.path().join("outside-file"),
+        )
+        .unwrap();
+        let root = fs::canonicalize(served.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let state = StateStore::new(None).unwrap();
+            for _ in 0..5 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection(
+                    stream,
+                    &root,
+                    &CollaborationHub::default(),
+                    &ReviewHub::default(),
+                    false,
+                    None,
+                    &state,
+                )
+                .unwrap();
+            }
+        });
+
+        let root_listing = test_http_request(address, "GET", "/", "");
+        assert!(root_listing
+            .contains("class=\"entry folder\"><a class=\"folder-open\" href=\"/Documents/\""));
+        let documents_position = root_listing
+            .find("class=\"entry-name\">Documents</span>")
+            .unwrap();
+        let outside_file_position = root_listing
+            .find("class=\"entry-name\">outside-file</span>")
+            .unwrap();
+        assert!(documents_position < outside_file_position);
+
+        let favourite =
+            test_http_request(address, "PUT", "/Documents/?mode=directory-favourite", "");
+        assert!(favourite.starts_with("HTTP/1.1 204 No Content"));
+        let listing = test_http_request(address, "GET", "/Documents/", "");
+        assert!(listing.starts_with("HTTP/1.1 200 OK"));
+        assert!(listing.contains(
+            "id=\"directory-favourite-toggle\" type=\"button\" aria-pressed=\"true\">移出收藏夹"
+        ));
+        assert!(listing.contains(
+            "class=\"entry folder\"><a class=\"folder-open\" href=\"/Documents/nested/\""
+        ));
+        assert!(listing.contains("data-directory-favourite-toggle=\"/Documents/nested/\""));
+        let file = test_http_request(address, "GET", "/Documents/nested/note.txt", "");
+        assert!(file.starts_with("HTTP/1.1 200 OK"));
+        assert!(file.ends_with("through symlink"));
+        let direct_file_link = test_http_request(address, "GET", "/outside-file", "");
+        assert!(direct_file_link.starts_with("HTTP/1.1 403 Forbidden"));
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_mode_serves_external_directory_symlink_contents() {
+        use std::os::unix::fs::symlink;
+
+        let served = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fs::create_dir(external.path().join("nested")).unwrap();
+        fs::write(external.path().join("index.html"), "external index").unwrap();
+        fs::write(external.path().join("nested/note.txt"), "external note").unwrap();
+        symlink(external.path(), served.path().join("site")).unwrap();
+        let root = fs::canonicalize(served.path()).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let state = StateStore::new(None).unwrap();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection(
+                    stream,
+                    &root,
+                    &CollaborationHub::default(),
+                    &ReviewHub::default(),
+                    true,
+                    None,
+                    &state,
+                )
+                .unwrap();
+            }
+        });
+
+        let index = test_http_request(address, "GET", "/site/", "");
+        assert!(index.starts_with("HTTP/1.1 200 OK"));
+        assert!(index.ends_with("external index"));
+        let file = test_http_request(address, "GET", "/site/nested/note.txt", "");
+        assert!(file.starts_with("HTTP/1.1 200 OK"));
+        assert!(file.ends_with("external note"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn image_heavy_directory_offers_gallery_switch() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -6834,7 +7576,8 @@ mod tests {
         assert!(page.contains("src=\"/icon.svg?mode=asset&amp;v="));
         assert!(page.contains("class=\"entry file\" href=\"/notes.md\""));
         assert!(!page.contains("notes.md?mode=thumb"));
-        assert!(page.contains("class=\"entry folder\" href=\"/docs/\""));
+        assert!(page.contains("class=\"entry folder\"><a class=\"folder-open\" href=\"/docs/\""));
+        assert!(page.contains("class=\"folder-favourite-toggle\" type=\"button\" data-directory-favourite-toggle=\"/docs/\" aria-pressed=\"false\""));
         assert!(page.contains("data-list-src=\"/photo.png?mode=thumb&amp;v="));
         assert!(
             page.contains(".entry.image .glyph img { width:100%; height:100%; object-fit:cover;")

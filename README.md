@@ -28,6 +28,9 @@ cargo run --release -- -p 3000 --dir /data/photos
 # 启用持久状态与图片衍生缓存
 cargo run --release -- -p 3000 --dir /data/photos --cache /data/webdir.cache
 
+# 为所有访问启用 token 认证
+cargo run --release -- -p 3000 --dir /data/photos --auth-token your-token
+
 # 启动后写入 PID 文件
 cargo run --release -- -p 3000 --pid /tmp/webdir.pid
 ```
@@ -41,6 +44,10 @@ cargo build --release
 
 未显式指定端口时，如果 `8080` 已被占用，服务会自动选择一个可用端口。相对路径以启动时的
 当前目录为基准。
+
+指定 `--auth-token` 后，所有页面、资源、接口和 WebSocket 都需要认证。首次访问会提示输入 token；
+验证成功后浏览器会将 token 保存在 localStorage，并在刷新或服务重启后自动重新验证。token 不会写入
+`--cache` 或其他本地文件。未指定该参数时，服务保持无认证模式，即使浏览器遗留旧 token 也会正常放行。
 
 ## 图片评论与 AI 修图
 
@@ -124,6 +131,7 @@ codex> 处理掉 your-plan.md.review.json 的评论
 
 - `favourites` 保存图片点赞状态。
 - `deletion_marks` 保存待删除标记。
+- `directory_favourites` 保存目录收藏；目录页仅显示当前 `--dir` 及其子目录内的收藏，因此多个进程共享缓存时不会看到范围外目录。
 
 未指定 `--cache` 时使用进程内 SQLite，退出服务后状态自然消失。图片移动到整理目录时，相关状态会
 跟随新路径；图片被删除时，其状态同步清理。

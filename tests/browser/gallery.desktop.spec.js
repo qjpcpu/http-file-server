@@ -1,6 +1,34 @@
 const { test, expect } = require('@playwright/test');
 const { openGalleryImage } = require('./helpers');
 
+test('folder stars update favourites without reloading the directory', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#directory-favourite-toggle')).toHaveCount(0);
+  await page.evaluate(() => { window.directoryFavouriteTestMarker = true; });
+  const star = page.locator('[data-directory-favourite-toggle="/shortcut-folder/"]');
+  await star.click();
+  await expect(star).toHaveText('★');
+  await expect(page.locator('.directory-favourites')).toBeVisible();
+  await expect(page.locator('.directory-favourite a')).toHaveText('shortcut-folder');
+  expect(await page.evaluate(() => window.directoryFavouriteTestMarker)).toBe(true);
+  await star.click();
+  await expect(star).toHaveText('☆');
+  await expect(page.locator('.directory-favourites')).toHaveCount(0);
+
+  for (const suffix of ['', '-2', '-3', '-4']) {
+    await page.locator(`[data-directory-favourite-toggle="/shortcut-folder${suffix}/"]`).click();
+  }
+  await page.reload();
+  await expect(page.locator('.directory-favourites-more')).toBeVisible();
+  await expect(page.locator('.directory-favourites-more summary')).toContainText('更多');
+  await expect(page.locator('.directory-favourites-menu .directory-favourite')).toHaveCount(1);
+  await page.locator('.directory-favourites-more summary').click();
+  await expect(page.locator('.directory-favourites-more')).toHaveAttribute('open', '');
+  await page.locator('.directory-favourites-menu [data-directory-favourite-remove="/shortcut-folder-4/"]').click();
+  await expect(page.locator('.directory-favourites')).toBeVisible();
+  await expect(page.locator('.directory-favourites-list .directory-favourite')).toHaveCount(3);
+});
+
 test('portrait layout, horizontal transitions, toolbar wake-up, and explicit close', async ({page}) => {
   await openGalleryImage(page);
   await expect.poll(() => page.locator('.lightbox-image').evaluate(image => image.naturalWidth)).toBe(600);
