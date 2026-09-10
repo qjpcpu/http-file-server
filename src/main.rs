@@ -440,6 +440,77 @@ fn handle_connection_with_auth(
     };
 
     let metadata = fs::metadata(&canonical)?;
+    if mode.as_deref() == Some("directory-favourite-label") {
+        if method != "POST" || !metadata.is_dir() {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "请从目录页修改收藏名称\n",
+                head_only,
+            );
+        }
+        let body = match read_request_body(&mut reader, headers.content_length) {
+            Ok(body) => body,
+            Err(message) => return send_text(&mut stream, 400, "Bad Request", &message, false),
+        };
+        let label = match serde_json::from_str::<String>(&body) {
+            Ok(label) => label,
+            Err(_) => return send_text(&mut stream, 400, "Bad Request", "无效的收藏名称\n", false),
+        };
+        return match state.set_directory_favourite_label(&root.join(&relative), &label) {
+            Ok(()) => send_empty(&mut stream, 204, "No Content"),
+            Err(_) => send_text(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                "保存收藏名称失败，请重试。\n",
+                false,
+            ),
+        };
+    }
+    if mode.as_deref() == Some("directory-favourite-order") {
+        if method != "POST" || !metadata.is_dir() {
+            return send_text(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "请从目录页调整收藏夹顺序\n",
+                head_only,
+            );
+        }
+        let body = match read_request_body(&mut reader, headers.content_length) {
+            Ok(body) => body,
+            Err(message) => return send_text(&mut stream, 400, "Bad Request", &message, false),
+        };
+        let paths = match serde_json::from_str::<Vec<String>>(&body) {
+            Ok(paths) => paths,
+            Err(_) => {
+                return send_text(&mut stream, 400, "Bad Request", "无效的收藏夹顺序\n", false)
+            }
+        };
+        let paths = match paths
+            .iter()
+            .map(|path| percent_decode(path).and_then(|path| safe_relative_path(&path)))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(paths) => paths
+                .into_iter()
+                .map(|path| root.join(path))
+                .collect::<Vec<_>>(),
+            None => return send_text(&mut stream, 400, "Bad Request", "无效的收藏夹路径\n", false),
+        };
+        return match state.reorder_directory_favourites(&paths) {
+            Ok(()) => send_empty(&mut stream, 204, "No Content"),
+            Err(_) => send_text(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                "保存收藏夹顺序失败，请重试。\n",
+                false,
+            ),
+        };
+    }
     if mode.as_deref() == Some("directory-favourite") {
         if !matches!(method, "PUT" | "DELETE") || !metadata.is_dir() {
             return send_text(
@@ -1618,12 +1689,16 @@ fn render_directory_favourites(
     for (index, path) in favourites.iter().enumerate() {
         let relative = path.strip_prefix(root).unwrap_or(Path::new(""));
         let href = url_for_path(relative, true);
-        let label = if relative.as_os_str().is_empty() {
+        let path_label = if relative.as_os_str().is_empty() {
             "root".to_string()
         } else {
             relative.to_string_lossy().into_owned()
         };
-        let label_html = if let Some(name) = relative.file_name() {
+        let custom_label = state.directory_favourite_label(path)?;
+        let label = custom_label.as_deref().unwrap_or(&path_label);
+        let label_html = if custom_label.is_some() {
+            escape_html(label)
+        } else if let Some(name) = relative.file_name() {
             let parent = relative.parent().unwrap_or(Path::new(""));
             if parent.as_os_str().is_empty() {
                 escape_html(&label)
@@ -1643,7 +1718,7 @@ fn render_directory_favourites(
             ""
         };
         let item = format!(
-            "<span class=\"directory-favourite\" data-directory-favourite-path=\"{href}\"><a href=\"{href}\"{active} title=\"{label}\">{label_html}</a><button type=\"button\" data-directory-favourite-remove=\"{href}\" aria-label=\"移出收藏夹：{label}\" title=\"移出收藏夹\">×</button></span>"
+            "<span class=\"directory-favourite\" data-directory-favourite-path=\"{href}\" draggable=\"true\"><button class=\"directory-favourite-drag\" type=\"button\" aria-label=\"拖动排序：{label}\" title=\"拖动排序\">⠿</button><a href=\"{href}\"{active} title=\"{label}\">{label_html}</a><button type=\"button\" data-directory-favourite-remove=\"{href}\" aria-label=\"移出收藏夹：{label}\" title=\"移出收藏夹\">×</button></span>"
         );
         if index < 3 {
             items.push_str(&item);
@@ -2852,6 +2927,7 @@ const createDirectoryFavouriteItem = path => {
   const item = document.createElement('span');
   item.className = 'directory-favourite';
   item.dataset.directoryFavouritePath = favouritePathname(path);
+  item.draggable = true;
   const link = document.createElement('a');
   link.href = path;
   const parts = favouritePathname(path).split('/').filter(Boolean).map(decodeURIComponent);
@@ -2872,13 +2948,19 @@ const createDirectoryFavouriteItem = path => {
     link.textContent = label;
   }
   if (favouritePathname(path) === location.pathname) link.setAttribute('aria-current', 'page');
+  const drag = document.createElement('button');
+  drag.className = 'directory-favourite-drag';
+  drag.type = 'button';
+  drag.setAttribute('aria-label', `拖动排序：${label}`);
+  drag.title = '拖动排序';
+  drag.textContent = '⠿';
   const remove = document.createElement('button');
   remove.type = 'button';
   remove.dataset.directoryFavouriteRemove = path;
   remove.setAttribute('aria-label', `移出收藏夹：${label}`);
   remove.title = '移出收藏夹';
   remove.textContent = '×';
-  item.append(link, remove);
+  item.append(drag, link, remove);
   return item;
 };
 const ensureDirectoryFavourites = () => {
@@ -2900,6 +2982,190 @@ const ensureDirectoryFavouritesMore = nav => {
   nav.append(more);
   return more.querySelector('.directory-favourites-menu');
 };
+const directoryFavouriteItems = () => Array.from(
+  document.querySelectorAll('.directory-favourites-list .directory-favourite, .directory-favourites-menu .directory-favourite')
+);
+const renderDirectoryFavouriteOrder = items => {
+  const nav = document.querySelector('.directory-favourites');
+  if (!nav) return;
+  nav.querySelector('.directory-favourites-list').replaceChildren(...items.slice(0, 3));
+  if (items.length > 3) {
+    ensureDirectoryFavouritesMore(nav).replaceChildren(...items.slice(3));
+  } else {
+    nav.querySelector('.directory-favourites-more')?.remove();
+  }
+};
+const moveDirectoryFavourite = (dragged, target) => {
+  const items = directoryFavouriteItems();
+  const from = items.indexOf(dragged);
+  const to = items.indexOf(target);
+  if (from < 0 || to < 0 || from === to) return;
+  items.splice(from, 1);
+  items.splice(to, 0, dragged);
+  renderDirectoryFavouriteOrder(items);
+};
+const saveDirectoryFavouriteOrder = async previous => {
+  try {
+    const url = new URL(location.pathname, location.origin);
+    url.searchParams.set('mode', 'directory-favourite-order');
+    const paths = directoryFavouriteItems().map(item => item.dataset.directoryFavouritePath);
+    const response = await fetch(url, {method: 'POST', body: JSON.stringify(paths)});
+    if (!response.ok) throw new Error('保存收藏夹顺序失败，请重试。');
+  } catch (error) {
+    renderDirectoryFavouriteOrder(previous);
+    directoryNotice.textContent = error.message;
+    directoryNotice.hidden = false;
+  }
+};
+let draggedDirectoryFavourite = null;
+let previousDirectoryFavouriteOrder = [];
+document.addEventListener('dragstart', event => {
+  const item = event.target.closest?.('.directory-favourite');
+  if (!item) return;
+  if (item.querySelector('.directory-favourite-name-input')) {
+    event.preventDefault();
+    return;
+  }
+  draggedDirectoryFavourite = item;
+  previousDirectoryFavouriteOrder = directoryFavouriteItems();
+  draggedDirectoryFavourite.classList.add('dragging');
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', draggedDirectoryFavourite.dataset.directoryFavouritePath);
+});
+document.addEventListener('dragover', event => {
+  if (!draggedDirectoryFavourite) return;
+  const target = event.target.closest?.('.directory-favourite');
+  if (!target || target === draggedDirectoryFavourite) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  moveDirectoryFavourite(draggedDirectoryFavourite, target);
+});
+document.addEventListener('drop', event => {
+  if (!draggedDirectoryFavourite || !event.target.closest?.('.directory-favourites')) return;
+  event.preventDefault();
+});
+document.addEventListener('dragend', () => {
+  if (!draggedDirectoryFavourite) return;
+  draggedDirectoryFavourite.classList.remove('dragging');
+  const changed = directoryFavouriteItems().some(
+    (item, index) => item !== previousDirectoryFavouriteOrder[index]
+  );
+  if (changed) saveDirectoryFavouriteOrder(previousDirectoryFavouriteOrder);
+  draggedDirectoryFavourite = null;
+});
+let touchDirectoryFavouriteDrag = null;
+document.addEventListener('pointerdown', event => {
+  const handle = event.target.closest?.('.directory-favourite-drag');
+  if (!handle || event.pointerType === 'mouse') return;
+  touchDirectoryFavouriteDrag = {
+    handle,
+    item: handle.closest('.directory-favourite'),
+    previous: directoryFavouriteItems(),
+    x: event.clientX,
+    y: event.clientY,
+    moved: false
+  };
+  handle.setPointerCapture(event.pointerId);
+});
+document.addEventListener('pointermove', event => {
+  const drag = touchDirectoryFavouriteDrag;
+  if (!drag) return;
+  if (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 6) return;
+  event.preventDefault();
+  drag.moved = true;
+  drag.item.classList.add('dragging');
+  const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('.directory-favourite');
+  if (target && target !== drag.item) moveDirectoryFavourite(drag.item, target);
+});
+const finishTouchDirectoryFavouriteDrag = event => {
+  const drag = touchDirectoryFavouriteDrag;
+  if (!drag) return;
+  drag.item.classList.remove('dragging');
+  if (event.type === 'pointerup' && drag.moved) saveDirectoryFavouriteOrder(drag.previous);
+  else if (drag.moved) renderDirectoryFavouriteOrder(drag.previous);
+  touchDirectoryFavouriteDrag = null;
+};
+document.addEventListener('pointerup', finishTouchDirectoryFavouriteDrag);
+document.addEventListener('pointercancel', finishTouchDirectoryFavouriteDrag);
+let directoryFavouriteNavigationTimer = null;
+document.addEventListener('click', event => {
+  const link = event.target.closest?.('.directory-favourite a');
+  if (!link) return;
+  if (link.classList.contains('editing')) {
+    event.preventDefault();
+    return;
+  }
+  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (event.detail === 0) return;
+  event.preventDefault();
+  clearTimeout(directoryFavouriteNavigationTimer);
+  if (event.detail === 1) {
+    directoryFavouriteNavigationTimer = setTimeout(() => location.assign(link.href), 260);
+  }
+});
+const renameDirectoryFavourite = item => {
+  const link = item.querySelector('a');
+  if (link.classList.contains('editing')) return;
+  clearTimeout(directoryFavouriteNavigationTimer);
+  const original = link.innerHTML;
+  const originalLabel = link.textContent;
+  const input = document.createElement('input');
+  input.className = 'directory-favourite-name-input';
+  input.type = 'text';
+  input.draggable = false;
+  input.value = originalLabel;
+  input.setAttribute('aria-label', `修改收藏名称：${originalLabel}`);
+  link.classList.add('editing');
+  link.draggable = false;
+  item.draggable = false;
+  link.replaceChildren(input);
+  input.focus();
+  input.select();
+  let finished = false;
+  const finish = async save => {
+    if (finished) return;
+    finished = true;
+    const label = input.value.trim();
+    link.classList.remove('editing');
+    link.draggable = true;
+    item.draggable = true;
+    if (!save || !label) {
+      link.innerHTML = original;
+      return;
+    }
+    link.textContent = label;
+    link.title = label;
+    item.querySelector('.directory-favourite-drag').setAttribute('aria-label', `拖动排序：${label}`);
+    item.querySelector('[data-directory-favourite-remove]').setAttribute('aria-label', `移出收藏夹：${label}`);
+    try {
+      const url = new URL(item.dataset.directoryFavouritePath, location.origin);
+      url.searchParams.set('mode', 'directory-favourite-label');
+      const response = await fetch(url, {method: 'POST', body: JSON.stringify(label)});
+      if (!response.ok) throw new Error('保存收藏名称失败，请重试。');
+    } catch (error) {
+      link.innerHTML = original;
+      link.title = originalLabel;
+      directoryNotice.textContent = error.message;
+      directoryNotice.hidden = false;
+    }
+  };
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      finish(true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener('blur', () => finish(true));
+};
+document.addEventListener('dblclick', event => {
+  const item = event.target.closest?.('.directory-favourite');
+  if (!item || event.target.closest('button')) return;
+  event.preventDefault();
+  renameDirectoryFavourite(item);
+});
 const setDirectoryFavouriteState = (path, favourite) => {
   const pathname = favouritePathname(path);
   document.querySelectorAll('[data-directory-favourite-toggle]').forEach(button => {
@@ -4652,13 +4918,18 @@ main { width:min(100% - 2rem,980px); margin:0 auto; padding:clamp(1.5rem,6vw,5re
 .directory-favourites-menu { position:absolute; z-index:4; top:calc(100% + .45rem); right:0; display:grid; gap:.35rem; width:min(24rem,calc(100vw - 2rem)); max-height:min(60vh,28rem); overflow:auto; padding:.45rem; border:1px solid var(--line); border-radius:.65rem; background:var(--surface); box-shadow:0 12px 28px rgba(27,31,52,.16); }
 .directory-favourites-menu .directory-favourite { width:100%; }
 .directory-favourites-menu .directory-favourite a { max-width:none; flex:1 1 auto; }
-.directory-favourite { flex:0 0 auto; display:flex; overflow:hidden; border:1px solid var(--line); border-radius:.5rem; background:var(--surface); }
+.directory-favourite { flex:0 0 auto; display:flex; overflow:hidden; border:1px solid var(--line); border-radius:.5rem; background:var(--surface); transition:opacity .12s ease,transform .12s ease; }
+.directory-favourite.dragging { opacity:.5; transform:scale(.98); }
 .directory-favourite a { display:flex; align-items:center; max-width:min(15rem,55vw); min-width:0; overflow:hidden; padding:.42rem .25rem .42rem .6rem; color:var(--ink); font:600 .72rem/1 ui-monospace,SFMono-Regular,Consolas,monospace; text-decoration:none; white-space:nowrap; }
+.directory-favourite a.editing { min-width:8rem; padding:.18rem .25rem; -webkit-user-drag:none; }
+.directory-favourite-name-input { width:100%; min-width:0; padding:.22rem .35rem; border:1px solid var(--accent); border-radius:.28rem; color:var(--ink); background:var(--paper); font:inherit; outline:0; user-select:text; -webkit-user-drag:none; }
 .directory-favourite-prefix { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .directory-favourite-separator,.directory-favourite-leaf { flex:0 0 auto; }
 .directory-favourite a:hover,.directory-favourite a[aria-current="page"] { color:var(--accent); background:var(--accent-soft); }
 .directory-favourite button { width:1.8rem; padding:0; border:0; border-left:1px solid var(--line); color:var(--muted); background:transparent; font-size:1rem; cursor:pointer; }
 .directory-favourite button:hover { color:var(--accent); background:var(--accent-soft); }
+.directory-favourite .directory-favourite-drag { border-right:1px solid var(--line); border-left:0; font-size:.82rem; cursor:grab; touch-action:none; user-select:none; }
+.directory-favourite .directory-favourite-drag:active { cursor:grabbing; }
 main>header { position:relative; padding:clamp(1.4rem,4vw,2.5rem); overflow:hidden; border:1px solid var(--line); border-radius:1.1rem 1.1rem 0 0; background:var(--surface); }
 main>header::after { position:absolute; right:-1.4rem; bottom:-3.2rem; width:9rem; height:7rem; border:1.1rem solid var(--accent-soft); border-radius:1.2rem; content:""; transform:rotate(-8deg); }
 .view-toggle { position:absolute; z-index:2; right:clamp(1rem,3vw,2rem); top:clamp(1rem,3vw,2rem); display:flex; align-items:center; gap:.45rem; min-height:2.35rem; padding:.55rem .8rem; border:1px solid var(--line); border-radius:.65rem; color:var(--ink); background:var(--surface); box-shadow:0 6px 18px rgba(54,59,92,.08); font:700 .75rem/1 ui-sans-serif,-apple-system,sans-serif; cursor:pointer; }

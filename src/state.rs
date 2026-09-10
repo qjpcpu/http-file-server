@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,10 @@ impl StateStore {
                 CREATE TABLE IF NOT EXISTS directory_favourites (
                     path BLOB PRIMARY KEY NOT NULL,
                     created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS directory_favourite_labels (
+                    path BLOB PRIMARY KEY NOT NULL,
+                    label TEXT NOT NULL
                 );",
             )
             .map_err(sqlite_error)?;
@@ -60,7 +65,7 @@ impl StateStore {
     }
 
     pub(crate) fn set_directory_favourite(&self, path: &Path, value: bool) -> io::Result<()> {
-        let connection = self.connection.lock().unwrap();
+        let mut connection = self.connection.lock().unwrap();
         if value {
             let created_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -74,20 +79,50 @@ impl StateStore {
                 .map(|_| ())
                 .map_err(sqlite_error)
         } else {
-            connection
+            let transaction = connection.transaction().map_err(sqlite_error)?;
+            transaction
                 .execute(
                     "DELETE FROM directory_favourites WHERE path = ?1",
                     params![path_bytes(path)],
                 )
-                .map(|_| ())
-                .map_err(sqlite_error)
+                .map_err(sqlite_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM directory_favourite_labels WHERE path = ?1",
+                    params![path_bytes(path)],
+                )
+                .map_err(sqlite_error)?;
+            transaction.commit().map_err(sqlite_error)
         }
+    }
+
+    pub(crate) fn directory_favourite_label(&self, path: &Path) -> io::Result<Option<String>> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT label FROM directory_favourite_labels WHERE path = ?1",
+                params![path_bytes(path)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)
+    }
+
+    pub(crate) fn set_directory_favourite_label(&self, path: &Path, label: &str) -> io::Result<()> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO directory_favourite_labels (path, label) VALUES (?1, ?2)",
+                params![path_bytes(path), label],
+            )
+            .map(|_| ())
+            .map_err(sqlite_error)
     }
 
     pub(crate) fn directory_favourites_within(&self, root: &Path) -> io::Result<Vec<PathBuf>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection
-            .prepare("SELECT path FROM directory_favourites ORDER BY rowid ASC")
+            .prepare("SELECT path FROM directory_favourites ORDER BY created_at ASC, rowid ASC")
             .map_err(sqlite_error)?;
         let paths = statement
             .query_map([], |row| {
@@ -102,6 +137,41 @@ impl StateStore {
             .into_iter()
             .filter(|path| path.starts_with(root))
             .collect())
+    }
+
+    pub(crate) fn reorder_directory_favourites(&self, ordered: &[PathBuf]) -> io::Result<()> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction().map_err(sqlite_error)?;
+        let mut favourites = {
+            let mut statement = transaction
+                .prepare("SELECT path FROM directory_favourites ORDER BY created_at ASC, rowid ASC")
+                .map_err(sqlite_error)?;
+            let paths = statement
+                .query_map([], |row| {
+                    let bytes: Vec<u8> = row.get(0)?;
+                    Ok(PathBuf::from(unsafe {
+                        std::ffi::OsString::from_encoded_bytes_unchecked(bytes)
+                    }))
+                })
+                .map_err(sqlite_error)?;
+            paths.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+        };
+        let reordered = ordered.iter().collect::<HashSet<_>>();
+        let mut replacements = ordered.iter();
+        for path in &mut favourites {
+            if reordered.contains(path) {
+                *path = replacements.next().unwrap().clone();
+            }
+        }
+        for (index, path) in favourites.iter().enumerate() {
+            transaction
+                .execute(
+                    "UPDATE directory_favourites SET created_at = ?1 WHERE path = ?2",
+                    params![index as i64, path_bytes(path)],
+                )
+                .map_err(sqlite_error)?;
+        }
+        transaction.commit().map_err(sqlite_error)
     }
 
     pub(crate) fn clear_image_state(&self, path: &Path) -> io::Result<()> {
@@ -196,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_favourites_keep_addition_order_and_are_limited_to_the_serving_root() {
+    fn directory_favourites_can_be_reordered_and_are_limited_to_the_serving_root() {
         let cache = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let root = workspace.path().join("photos");
@@ -218,10 +288,26 @@ mod tests {
             vec![root.clone(), nested.clone()]
         );
         assert!(state.is_directory_favourite(&other).unwrap());
+        state
+            .reorder_directory_favourites(&[nested.clone(), root.clone()])
+            .unwrap();
+        state
+            .set_directory_favourite_label(&nested, "常用图片")
+            .unwrap();
+        assert_eq!(
+            state.directory_favourite_label(&nested).unwrap().as_deref(),
+            Some("常用图片")
+        );
+        assert_eq!(
+            state.directory_favourites_within(&root).unwrap(),
+            vec![nested.clone(), root.clone()]
+        );
         state.set_directory_favourite(&root, false).unwrap();
         assert_eq!(
             state.directory_favourites_within(&root).unwrap(),
-            vec![nested]
+            vec![nested.clone()]
         );
+        state.set_directory_favourite(&nested, false).unwrap();
+        assert_eq!(state.directory_favourite_label(&nested).unwrap(), None);
     }
 }

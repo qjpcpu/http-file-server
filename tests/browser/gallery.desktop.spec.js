@@ -2,6 +2,9 @@ const { test, expect } = require('@playwright/test');
 const { openGalleryImage } = require('./helpers');
 
 test('folder stars update favourites without reloading the directory', async ({page}) => {
+  for (const suffix of ['', '-2', '-3', '-4']) {
+    await page.request.delete(`/shortcut-folder${suffix}/?mode=directory-favourite`);
+  }
   await page.goto('/');
   await expect(page.locator('#directory-favourite-toggle')).toHaveCount(0);
   await page.evaluate(() => { window.directoryFavouriteTestMarker = true; });
@@ -11,6 +14,25 @@ test('folder stars update favourites without reloading the directory', async ({p
   await expect(page.locator('.directory-favourites')).toBeVisible();
   await expect(page.locator('.directory-favourite a')).toHaveText('shortcut-folder');
   expect(await page.evaluate(() => window.directoryFavouriteTestMarker)).toBe(true);
+
+  await page.locator('.directory-favourite a').dblclick();
+  const nameInput = page.locator('.directory-favourite-name-input');
+  const inputBox = await nameInput.boundingBox();
+  await page.mouse.move(inputBox.x + 8, inputBox.y + inputBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(inputBox.x + inputBox.width - 8, inputBox.y + inputBox.height / 2);
+  await page.mouse.up();
+  await expect(nameInput).toBeFocused();
+  await expect(page.locator('.directory-favourite')).not.toHaveClass(/dragging/);
+  await expect.poll(() => nameInput.evaluate(input => input.selectionEnd > input.selectionStart)).toBe(true);
+  await nameInput.fill('工作资料');
+  await nameInput.press('Enter');
+  await expect(page.locator('.directory-favourite a')).toHaveText('工作资料');
+  await expect(page.locator('.directory-favourite a')).toHaveAttribute('href', '/shortcut-folder/');
+  await page.reload();
+  await expect(page.locator('.directory-favourite a')).toHaveText('工作资料');
+  await expect(page.locator('.directory-favourite a')).toHaveAttribute('href', '/shortcut-folder/');
+
   await star.click();
   await expect(star).toHaveText('☆');
   await expect(page.locator('.directory-favourites')).toHaveCount(0);
@@ -22,11 +44,36 @@ test('folder stars update favourites without reloading the directory', async ({p
   await expect(page.locator('.directory-favourites-more')).toBeVisible();
   await expect(page.locator('.directory-favourites-more summary')).toContainText('更多');
   await expect(page.locator('.directory-favourites-menu .directory-favourite')).toHaveCount(1);
+
+  await page.locator('[data-directory-favourite-path="/shortcut-folder/"]')
+    .dragTo(page.locator('[data-directory-favourite-path="/shortcut-folder-3/"]'));
+  await expect.poll(() => page.locator('.directory-favourites-list .directory-favourite')
+    .evaluateAll(items => items.map(item => item.dataset.directoryFavouritePath)))
+    .toEqual(['/shortcut-folder-2/', '/shortcut-folder-3/', '/shortcut-folder/']);
+  await page.reload();
+  await expect.poll(() => page.locator('.directory-favourites-list .directory-favourite')
+    .evaluateAll(items => items.map(item => item.dataset.directoryFavouritePath)))
+    .toEqual(['/shortcut-folder-2/', '/shortcut-folder-3/', '/shortcut-folder/']);
+
   await page.locator('.directory-favourites-more summary').click();
   await expect(page.locator('.directory-favourites-more')).toHaveAttribute('open', '');
-  await page.locator('.directory-favourites-menu [data-directory-favourite-remove="/shortcut-folder-4/"]').click();
+  await page.locator('[data-directory-favourite-path="/shortcut-folder-4/"]')
+    .dragTo(page.locator('[data-directory-favourite-path="/shortcut-folder-2/"]'));
+  await expect.poll(() => page.locator('.directory-favourites-list .directory-favourite')
+    .evaluateAll(items => items.map(item => item.dataset.directoryFavouritePath)))
+    .toEqual(['/shortcut-folder-4/', '/shortcut-folder-2/', '/shortcut-folder-3/']);
+  await page.reload();
+  await expect.poll(() => page.locator('.directory-favourites-list .directory-favourite')
+    .evaluateAll(items => items.map(item => item.dataset.directoryFavouritePath)))
+    .toEqual(['/shortcut-folder-4/', '/shortcut-folder-2/', '/shortcut-folder-3/']);
+
+  await page.locator('.directory-favourites-more summary').click();
+  await page.locator('.directory-favourites-menu [data-directory-favourite-remove="/shortcut-folder/"]').click();
   await expect(page.locator('.directory-favourites')).toBeVisible();
   await expect(page.locator('.directory-favourites-list .directory-favourite')).toHaveCount(3);
+  for (const suffix of ['-2', '-3', '-4']) {
+    await page.request.delete(`/shortcut-folder${suffix}/?mode=directory-favourite`);
+  }
 });
 
 test('portrait layout, horizontal transitions, toolbar wake-up, and explicit close', async ({page}) => {
