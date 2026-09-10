@@ -3278,10 +3278,12 @@ const scrollJumps = document.querySelector('#scroll-jumps');
 const scrollToTop = scrollJumps.querySelector('#scroll-to-top');
 const scrollToBottom = scrollJumps.querySelector('#scroll-to-bottom');
 let scrollJumpFrame = null;
+let scrollJumpHideTimer = null;
+let scrollJumpsVisible = false;
 const updateScrollJumps = () => {
   scrollJumpFrame = null;
   const maximum = Math.max(0, document.documentElement.scrollHeight - innerHeight);
-  scrollJumps.hidden = maximum < 48;
+  scrollJumps.hidden = maximum < 48 || !scrollJumpsVisible;
   scrollToTop.disabled = scrollY <= 4;
   scrollToBottom.disabled = scrollY >= maximum - 4;
 };
@@ -3289,13 +3291,22 @@ const scheduleScrollJumpUpdate = () => {
   if (scrollJumpFrame !== null) return;
   scrollJumpFrame = requestAnimationFrame(updateScrollJumps);
 };
+const revealScrollJumps = () => {
+  scrollJumpsVisible = true;
+  clearTimeout(scrollJumpHideTimer);
+  scheduleScrollJumpUpdate();
+  scrollJumpHideTimer = setTimeout(() => {
+    scrollJumpsVisible = false;
+    scheduleScrollJumpUpdate();
+  }, 900);
+};
 const jumpScroll = top => window.scrollTo({
   top,
   behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
 });
 scrollToTop.addEventListener('click', () => jumpScroll(0));
 scrollToBottom.addEventListener('click', () => jumpScroll(document.documentElement.scrollHeight));
-addEventListener('scroll', scheduleScrollJumpUpdate, {passive: true});
+addEventListener('scroll', revealScrollJumps, {passive: true});
 addEventListener('resize', scheduleScrollJumpUpdate);
 new ResizeObserver(scheduleScrollJumpUpdate).observe(document.body);
 updateScrollJumps();

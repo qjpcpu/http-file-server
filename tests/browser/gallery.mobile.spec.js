@@ -1,6 +1,17 @@
 const { test, expect } = require('@playwright/test');
 const { dispatchTouchPointer, openGalleryImage } = require('./helpers');
 
+test('page jump buttons only appear while the page is scrolling', async ({page}) => {
+  await page.goto('/?view=gallery');
+  const scrollJumps = page.locator('#scroll-jumps');
+
+  await expect(scrollJumps).toBeHidden();
+  await page.evaluate(() => window.scrollTo(0, 200));
+  await expect(scrollJumps).toBeVisible();
+  await page.waitForTimeout(1000);
+  await expect(scrollJumps).toBeHidden();
+});
+
 test('mobile directory favourites keep every shortcut reachable without overlapping folder stars', async ({page}) => {
   test.skip(page.viewportSize().width > 650, 'phone layout only');
   for (const suffix of ['', '-2', '-3', '-4']) {
